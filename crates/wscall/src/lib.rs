@@ -1,0 +1,45 @@
+//! WSCALL facade crate.
+//!
+//! This crate re-exports the shared protocol layer and, via feature flags,
+//! the reusable server and client implementations.
+//!
+//! Common usage:
+//!
+//! ```toml
+//! [dependencies]
+//! wscall = { version = "0.1", features = ["full"] }
+//! ```
+//!
+//! Use the `server` feature for `WscallServer`, the `client` feature for
+//! `WscallClient`, or `full` to enable both.
+
+/// Shared protocol types and frame codec.
+pub mod protocol {
+    pub use wscall_protocol::*;
+}
+
+pub use wscall_protocol::{
+    EncryptionKind, ErrorPayload, FileAttachment, FrameCodec, MessageType, PacketBody,
+    PacketEnvelope, ProtocolError,
+};
+
+#[cfg(feature = "server")]
+/// Server-side exports.
+pub mod server {
+    pub use wscall_server::*;
+}
+
+#[cfg(feature = "client")]
+/// Client-side exports.
+pub mod client {
+    pub use wscall_client::*;
+}
+
+#[cfg(feature = "server")]
+pub use wscall_server::{
+    ApiContext, ApiError, EventContext, ExceptionContext, ServerError, ServerHandle,
+    ValidateParams, WscallServer, validation,
+};
+
+#[cfg(feature = "client")]
+pub use wscall_client::{ClientError, EventMessage, WscallClient};

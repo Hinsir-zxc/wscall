@@ -1,0 +1,25 @@
+[package]
+name = "wscall-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Client SDK for WSCALL"
+documentation = "https://docs.rs/wscall-client"
+readme = "../../README.md"
+keywords = ["websocket", "client", "rpc", "async", "sdk"]
+categories = ["network-programming", "web-programming::websocket", "asynchronous"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+futures-util.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+uuid.workspace = true
+wscall-protocol = { path = "../wscall-protocol", version = "0.1.0" }

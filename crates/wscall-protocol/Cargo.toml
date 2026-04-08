@@ -1,0 +1,25 @@
+[package]
+name = "wscall-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Shared protocol types and frame codec for WSCALL"
+documentation = "https://docs.rs/wscall-protocol"
+readme = "../../README.md"
+keywords = ["websocket", "protocol", "frame", "crypto", "codec"]
+categories = ["network-programming", "web-programming::websocket", "encoding"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+aes-gcm.workspace = true
+base64.workspace = true
+chacha20poly1305.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
