@@ -7,6 +7,8 @@ This workspace publishes a crate family with dependency ordering:
 3. `wscall-client`
 4. `wscall`
 
+Current target release: `0.1.1`
+
 ## Pre-release checks
 
 Run the standard quality gates from the workspace root:
@@ -26,13 +28,15 @@ cargo package -p wscall-protocol
 Update release-facing documents before publishing:
 
 1. Move relevant items from `Unreleased` to the target version in `CHANGELOG.md`.
-2. Confirm `README.md` still reflects the current examples and feature flags.
-3. Confirm the version number is aligned across the workspace.
+2. Confirm `README.md` still reflects the current examples, lifecycle APIs, reconnect behavior, and feature flags.
+3. Confirm the version number is aligned across the workspace and all internal dependency pins.
+4. Confirm `RELEASE.md` still reflects the current publish order and target version.
 
-## First release caveat
+## Dependency publish caveat
 
-For the first release, `cargo package` for `wscall-server`, `wscall-client`, and `wscall`
-cannot fully verify until their lower-level dependencies are already available on crates.io.
+For any release where the dependency version is not yet present on crates.io, `cargo package`
+for `wscall-server`, `wscall-client`, and `wscall` can only be completed in publish order after
+their lower-level crates become available on crates.io.
 
 That means:
 
@@ -45,6 +49,7 @@ That means:
 ## Suggested command sequence
 
 ```bash
+cargo package -p wscall-protocol
 cargo publish -p wscall-protocol
 # wait for crates.io index update
 
@@ -65,11 +70,12 @@ cargo publish -p wscall
 Run through this list before the first `cargo publish`:
 
 1. Working tree is clean or intentionally dirty for a local dry run.
-2. `CHANGELOG.md` includes the target version notes.
-3. `README.md` quick-start commands still work.
-4. Workspace quality gates pass.
-5. `wscall-protocol` packages successfully.
-6. The crates.io names you intend to publish are still available.
+2. Workspace version is set to `0.1.1` and internal crate dependency pins also use `0.1.1`.
+3. `CHANGELOG.md` includes the target version notes.
+4. `README.md` quick-start commands still work.
+5. Workspace quality gates pass.
+6. `wscall-protocol` packages successfully.
+7. The crates.io names you intend to publish are still available.
 
 ## Post-release checklist
 

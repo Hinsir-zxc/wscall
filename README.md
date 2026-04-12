@@ -42,15 +42,15 @@ Depend on only what you need:
 
 ```toml
 [dependencies]
-wscall-server = "0.1"
-wscall-client = "0.1"
+wscall-server = "0.1.1"
+wscall-client = "0.1.1"
 ```
 
 Or use the facade crate:
 
 ```toml
 [dependencies]
-wscall = { version = "0.1", features = ["full"] }
+wscall = { version = "0.1.1", features = ["full"] }
 ```
 
 ## Quick Start
@@ -158,11 +158,12 @@ Before publishing the crates to crates.io:
 
 1. Confirm the configured `repository` and `homepage` metadata still match the canonical repository.
 2. Run the quality gates locally.
-3. Run `cargo package` for `wscall-protocol` to validate the root dependency crate.
-4. Publish in dependency order: `wscall-protocol`, `wscall-server`, `wscall-client`, then `wscall`.
-5. After each publish, wait for the crates.io index to catch up before packaging or publishing the next dependent crate.
+3. Update all workspace crate versions and internal dependency pins to the target release version.
+4. Run `cargo package` for `wscall-protocol` to validate the root dependency crate.
+5. Publish in dependency order: `wscall-protocol`, `wscall-server`, `wscall-client`, then `wscall`.
+6. After each publish, wait for the crates.io index to catch up before packaging or publishing the next dependent crate.
 
-For the first release of this crate family, dependent crates such as `wscall-server` and `wscall-client` cannot complete a full standalone `cargo package` verification until `wscall-protocol` is already available on crates.io.
+For any release that introduces a new unpublished dependency version, downstream crates such as `wscall-server`, `wscall-client`, and `wscall` must still be published in dependency order so crates.io can resolve the freshly published versions.
 
 See `RELEASE.md` for a release sequence that matches this dependency chain.
 

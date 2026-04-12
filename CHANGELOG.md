@@ -6,6 +6,20 @@ The format is based on Keep a Changelog and the project follows Semantic Version
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-04-12
+
+### Added
+
+1. Explicit client lifecycle callbacks with `on_connected` and `on_disconnected`.
+2. Explicit server lifecycle callbacks with `on_connected` and `on_disconnected`.
+3. Integration tests covering lifecycle notifications and client reconnection recovery.
+
+### Changed
+
+1. Client connections now automatically reconnect after unexpected disconnects.
+2. Reconnect retry delay now starts at 3 seconds, increases by 1 second per attempt, and caps at 30 seconds.
+3. README, release guide, and crate usage examples now document the lifecycle APIs and `0.1.1` installation versions.
+
 ## [0.1.0] - 2026-04-09
 
 ### Added

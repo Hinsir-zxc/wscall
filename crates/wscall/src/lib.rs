@@ -7,7 +7,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! wscall = { version = "0.1", features = ["full"] }
+//! wscall = { version = "0.1.1", features = ["full"] }
 //! ```
 //!
 //! Use the `server` feature for `WscallServer`, the `client` feature for

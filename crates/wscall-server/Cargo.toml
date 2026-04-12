@@ -25,4 +25,4 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 uuid.workspace = true
 validator.workspace = true
-wscall-protocol = { path = "../wscall-protocol", version = "0.1.0" }
+wscall-protocol = { path = "../wscall-protocol", version = "0.1.1" }
