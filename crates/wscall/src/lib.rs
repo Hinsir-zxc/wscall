@@ -37,9 +37,12 @@ pub mod client {
 
 #[cfg(feature = "server")]
 pub use wscall_server::{
-    ApiContext, ApiError, EventContext, ExceptionContext, ServerError, ServerHandle,
-    ValidateParams, WscallServer, validation,
+    ApiContext, ApiError, EventContext, ExceptionContext, ServerConnectionContext,
+    ServerDisconnectContext, ServerError, ServerHandle, ValidateParams, WscallServer,
+    validation,
 };
 
 #[cfg(feature = "client")]
-pub use wscall_client::{ClientError, EventMessage, WscallClient};
+pub use wscall_client::{
+    ClientConnectionEvent, ClientDisconnectEvent, ClientError, EventMessage, WscallClient,
+};

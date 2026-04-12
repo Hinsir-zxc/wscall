@@ -10,6 +10,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
 
     client
+        .on_connected(|event| async move {
+            println!("connected: {}", event.url);
+        })
+        .await;
+
+    client
+        .on_disconnected(|event| async move {
+            println!(
+                "disconnected: reason={}, retry_after={:?}",
+                event.reason, event.retry_after
+            );
+        })
+        .await;
+
+    client
         .on_event("system.notice", |event| async move {
             println!("notice: {}", event.data);
             json!({ "received": true })

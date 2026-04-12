@@ -10,7 +10,8 @@ pub mod validation;
 /// Main server type used to register routes, filters, and event handlers.
 pub use server_runtime::WscallServer;
 pub use server_types::{
-    ApiContext, ApiError, EventContext, ExceptionContext, ServerError, ServerHandle, ValidateParams,
+    ApiContext, ApiError, EventContext, ExceptionContext, ServerConnectionContext,
+    ServerDisconnectContext, ServerError, ServerHandle, ValidateParams,
 };
 /// Shared attachment model used by API calls and events.
 pub use wscall_protocol::FileAttachment;

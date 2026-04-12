@@ -86,6 +86,16 @@ use wscall::WscallClient;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let client = WscallClient::connect("ws://127.0.0.1:9001/socket").await?;
+	client
+		.on_connected(|event| async move {
+			println!("connected: {}", event.url);
+		})
+		.await;
+	client
+		.on_disconnected(|event| async move {
+			println!("disconnected: {}", event.reason);
+		})
+		.await;
 	let response = client
 		.call("system.echo", json!({ "message": "hello" }), Vec::new())
 		.await?;
@@ -95,6 +105,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	Ok(())
 }
 ```
+
+Client reconnect behavior:
+
+1. Unexpected disconnects trigger automatic reconnect attempts.
+2. The first retry waits 3 seconds.
+3. Each later retry increases the delay by 1 second.
+4. The retry delay is capped at 30 seconds.
+5. Calling `close()` stops reconnect attempts.
 
 Runnable end-to-end quick start:
 

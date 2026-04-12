@@ -12,8 +12,8 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"
-repository = "https://github.com/Hinsir-zxc/claws"
-homepage = "https://github.com/Hinsir-zxc/claws"
+repository = "https://github.com/Hinsir-zxc/wscall"
+homepage = "https://github.com/Hinsir-zxc/wscall"
 
 [workspace.dependencies]
 aes-gcm = "0.10"

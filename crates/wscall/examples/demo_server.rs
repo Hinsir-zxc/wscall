@@ -57,6 +57,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let history = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
     let mut server = WscallServer::new().with_chacha20_key(DEMO_CHACHA20_KEY);
 
+    server.on_connected(|ctx| async move {
+        println!(
+            "client connected: connection_id={}, peer_ip={:?}",
+            ctx.connection_id(),
+            ctx.peer_ip()
+        );
+    });
+
+    server.on_disconnected(|ctx| async move {
+        println!(
+            "client disconnected: connection_id={}, reason={}",
+            ctx.connection_id(),
+            ctx.reason()
+        );
+    });
+
     server.filter(|ctx| async move {
         if ctx.route().trim().is_empty() {
             return Err(ApiError::bad_request("route cannot be empty"));

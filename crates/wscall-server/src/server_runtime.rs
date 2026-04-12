@@ -18,8 +18,8 @@ use wscall_protocol::{
 };
 
 use crate::server_types::{
-    ApiContext, ApiError, EventContext, ExceptionContext, ServerError, ServerHandle,
-    ServerOutbound, ServerState,
+    ApiContext, ApiError, EventContext, ExceptionContext, ServerConnectionContext,
+    ServerDisconnectContext, ServerError, ServerHandle, ServerOutbound, ServerState,
 };
 
 const SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
@@ -32,6 +32,8 @@ type Filter =
     Arc<dyn Fn(ApiContext) -> BoxFuture<'static, Result<ApiContext, ApiError>> + Send + Sync>;
 type EventHandler =
     Arc<dyn Fn(EventContext) -> BoxFuture<'static, Result<Value, ApiError>> + Send + Sync>;
+type ConnectionHandler = Arc<dyn Fn(ServerConnectionContext) -> BoxFuture<'static, ()> + Send + Sync>;
+type DisconnectHandler = Arc<dyn Fn(ServerDisconnectContext) -> BoxFuture<'static, ()> + Send + Sync>;
 type ExceptionHandler =
     Arc<dyn Fn(ExceptionContext) -> BoxFuture<'static, ErrorPayload> + Send + Sync>;
 
@@ -122,6 +124,8 @@ pub struct WscallServer {
     routes: HashMap<String, ApiHandler>,
     filters: Vec<Filter>,
     event_handlers: HashMap<String, EventHandler>,
+    connection_handlers: Vec<ConnectionHandler>,
+    disconnect_handlers: Vec<DisconnectHandler>,
     exception_handler: Option<ExceptionHandler>,
     codec: FrameCodec,
     default_encryption: EncryptionKind,
@@ -142,6 +146,8 @@ impl WscallServer {
             routes: HashMap::new(),
             filters: Vec::new(),
             event_handlers: HashMap::new(),
+            connection_handlers: Vec::new(),
+            disconnect_handlers: Vec::new(),
             exception_handler: None,
             codec: FrameCodec::plaintext(),
             default_encryption: EncryptionKind::None,
@@ -234,6 +240,28 @@ impl WscallServer {
         self.event_handlers.insert(name.into(), handler);
     }
 
+    pub fn on_connected<F, Fut>(&mut self, handler: F)
+    where
+        F: Fn(ServerConnectionContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let handler = Arc::new(move |ctx: ServerConnectionContext| {
+            Box::pin(handler(ctx)) as BoxFuture<'static, ()>
+        });
+        self.connection_handlers.push(handler);
+    }
+
+    pub fn on_disconnected<F, Fut>(&mut self, handler: F)
+    where
+        F: Fn(ServerDisconnectContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let handler = Arc::new(move |ctx: ServerDisconnectContext| {
+            Box::pin(handler(ctx)) as BoxFuture<'static, ()>
+        });
+        self.disconnect_handlers.push(handler);
+    }
+
     pub fn exception_handler<F, Fut>(&mut self, handler: F)
     where
         F: Fn(ExceptionContext) -> Fut + Send + Sync + 'static,
@@ -276,6 +304,8 @@ impl WscallServer {
             .await
             .insert(connection_id.clone(), tx.clone());
 
+        self.notify_connected(&connection_id, Some(peer)).await;
+
         let codec = self.codec.clone();
         let writer = tokio::spawn(async move {
             while let Some(outbound) = rx.recv().await {
@@ -315,50 +345,59 @@ impl WscallServer {
             }
         });
 
-        self.handle()
-            .send_event_to(
-                &connection_id,
-                "system.notice",
-                json!({ "message": "connected", "connection_id": connection_id }),
-                Vec::new(),
-            )
-            .await
-            .map_err(ServerError::Api)?;
+        let result = async {
+            self.handle()
+                .send_event_to(
+                    &connection_id,
+                    "system.notice",
+                    json!({ "message": "connected", "connection_id": connection_id }),
+                    Vec::new(),
+                )
+                .await
+                .map_err(ServerError::Api)?;
 
-        let result = loop {
-            let next_message = timeout(SERVER_IDLE_TIMEOUT, stream.next()).await;
-            let Some(message) =
-                next_message.map_err(|_| ServerError::IdleTimeout(connection_id.clone()))?
-            else {
-                break Ok(());
-            };
+            loop {
+                let next_message = timeout(SERVER_IDLE_TIMEOUT, stream.next()).await;
+                let Some(message) =
+                    next_message.map_err(|_| ServerError::IdleTimeout(connection_id.clone()))?
+                else {
+                    break Ok(());
+                };
 
-            match message? {
-                Message::Binary(bytes) => {
-                    let packet = self.codec.decode(&bytes)?;
-                    self.process_packet(&connection_id, Some(peer), packet)
-                        .await?;
-                }
-                Message::Close(_) => break Ok(()),
-                Message::Ping(payload) => {
-                    if tx
-                        .send(ServerOutbound::Pong(payload.to_vec()))
-                        .await
-                        .is_err()
-                    {
-                        break Ok(());
+                match message? {
+                    Message::Binary(bytes) => {
+                        let packet = self.codec.decode(&bytes)?;
+                        self.process_packet(&connection_id, Some(peer), packet)
+                            .await?;
                     }
+                    Message::Close(_) => break Ok(()),
+                    Message::Ping(payload) => {
+                        if tx
+                            .send(ServerOutbound::Pong(payload.to_vec()))
+                            .await
+                            .is_err()
+                        {
+                            break Ok(());
+                        }
+                    }
+                    Message::Pong(_) => {}
+                    Message::Text(_) => {}
+                    Message::Frame(_) => {}
                 }
-                Message::Pong(_) => {}
-                Message::Text(_) => {}
-                Message::Frame(_) => {}
             }
-        };
+        }
+        .await;
 
         self.state.clients.write().await.remove(&connection_id);
         let _ = tx.send(ServerOutbound::Close).await;
         heartbeat.abort();
         writer.abort();
+        self.notify_disconnected(
+            &connection_id,
+            Some(peer),
+            Self::disconnect_reason(&result),
+        )
+        .await;
         result
     }
 
@@ -644,6 +683,54 @@ impl WscallServer {
             },
             self.default_encryption,
         )
+    }
+
+    async fn notify_connected(
+        &self,
+        connection_id: &str,
+        peer_addr: Option<std::net::SocketAddr>,
+    ) {
+        let handlers = self.connection_handlers.clone();
+        for handler in handlers {
+            let context = ServerConnectionContext {
+                connection_id: connection_id.to_string(),
+                peer_addr,
+                server: self.handle(),
+            };
+
+            if AssertUnwindSafe(handler(context)).catch_unwind().await.is_err() {
+                eprintln!("server connected handler panicked");
+            }
+        }
+    }
+
+    async fn notify_disconnected(
+        &self,
+        connection_id: &str,
+        peer_addr: Option<std::net::SocketAddr>,
+        reason: String,
+    ) {
+        let handlers = self.disconnect_handlers.clone();
+        for handler in handlers {
+            let context = ServerDisconnectContext {
+                connection_id: connection_id.to_string(),
+                peer_addr,
+                reason: reason.clone(),
+                server: self.handle(),
+            };
+
+            if AssertUnwindSafe(handler(context)).catch_unwind().await.is_err() {
+                eprintln!("server disconnected handler panicked");
+            }
+        }
+    }
+
+    fn disconnect_reason(result: &Result<(), ServerError>) -> String {
+        match result {
+            Ok(()) => "connection closed".to_string(),
+            Err(ServerError::IdleTimeout(_)) => "idle timeout".to_string(),
+            Err(error) => error.to_string(),
+        }
     }
 
     async fn map_exception(&self, context: ExceptionContext) -> ErrorPayload {

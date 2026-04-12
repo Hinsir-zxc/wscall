@@ -92,5 +92,5 @@ Make sure each crate manifest has final values for:
 Current configured repository:
 
 ```text
-https://github.com/Hinsir-zxc/claws
+https://github.com/Hinsir-zxc/wscall
 ```

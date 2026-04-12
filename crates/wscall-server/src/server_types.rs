@@ -30,6 +30,72 @@ pub struct ServerHandle {
     pub(crate) default_encryption: EncryptionKind,
 }
 
+/// Context passed to server connection lifecycle handlers.
+#[derive(Clone)]
+pub struct ServerConnectionContext {
+    pub(crate) connection_id: String,
+    pub(crate) peer_addr: Option<SocketAddr>,
+    pub(crate) server: ServerHandle,
+}
+
+impl ServerConnectionContext {
+    /// Returns the logical connection id for the current client.
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
+    }
+
+    /// Returns the peer socket address when available.
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer_addr
+    }
+
+    /// Returns the peer IP as a string when available.
+    pub fn peer_ip(&self) -> Option<String> {
+        self.peer_addr.map(|addr| addr.ip().to_string())
+    }
+
+    /// Returns a server handle for outbound event operations.
+    pub fn server(&self) -> &ServerHandle {
+        &self.server
+    }
+}
+
+/// Context passed to server disconnect lifecycle handlers.
+#[derive(Clone)]
+pub struct ServerDisconnectContext {
+    pub(crate) connection_id: String,
+    pub(crate) peer_addr: Option<SocketAddr>,
+    pub(crate) reason: String,
+    pub(crate) server: ServerHandle,
+}
+
+impl ServerDisconnectContext {
+    /// Returns the logical connection id for the disconnected client.
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
+    }
+
+    /// Returns the peer socket address when available.
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer_addr
+    }
+
+    /// Returns the peer IP as a string when available.
+    pub fn peer_ip(&self) -> Option<String> {
+        self.peer_addr.map(|addr| addr.ip().to_string())
+    }
+
+    /// Returns the human-readable disconnect reason.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    /// Returns a server handle for outbound event operations.
+    pub fn server(&self) -> &ServerHandle {
+        &self.server
+    }
+}
+
 /// Request context passed to API route handlers.
 #[derive(Clone)]
 pub struct ApiContext {
