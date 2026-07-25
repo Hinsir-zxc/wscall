@@ -4,6 +4,10 @@ use wscall::{WscallClient, WscallServer};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
     let address = "127.0.0.1:9010";
     let url = "ws://127.0.0.1:9010/socket";
 

@@ -3,11 +3,16 @@
 //! This crate contains the transport envelope, frame codec, encryption modes,
 //! and inline attachment model used by both the server and client crates.
 
+use std::borrow::Cow;
+use std::sync::Arc;
+
 use aes_gcm::{Aes256Gcm, KeyInit as AesKeyInit, Nonce as AesNonce, aead::Aead as AesAead};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use getrandom::getrandom;
+use serde::de::Deserializer;
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -133,13 +138,30 @@ pub struct ErrorPayload {
     pub details: Option<Value>,
 }
 
+/// Compact numeric tag identifying each [`PacketBody`] variant in the JSON
+/// wire format. Using a single-byte numeric field (`"k": 0`) instead of a
+/// string tag (`"kind": "api_request"`) saves several bytes per frame.
+pub const K_API_REQUEST: u8 = 0;
+pub const K_EVENT_EMIT: u8 = 1;
+pub const K_API_RESPONSE: u8 = 2;
+pub const K_EVENT_ACK: u8 = 3;
+
 /// JSON-level message body transported inside a WSCALL frame.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+///
+/// The wire format uses short single-letter keys and a numeric `k` tag to
+/// minimize per-frame overhead:
+///
+/// | Variant | `k` | Fields |
+/// | --- | --- | --- |
+/// | `ApiRequest`  | 0 | `i` `r` `p` `a` `m` |
+/// | `EventEmit`   | 1 | `i` `n` `d` `a` `m` `e` [`si`] |
+/// | `ApiResponse` | 2 | `i` `o` `s` `d` `m` [`er`] |
+/// | `EventAck`    | 3 | `i` `o` `rc` [`er`] |
+#[derive(Debug, Clone)]
 pub enum PacketBody {
     /// Client-to-server API request.
     ApiRequest {
-        request_id: String,
+        request_id: u64,
         route: String,
         params: Value,
         attachments: Vec<FileAttachment>,
@@ -147,31 +169,254 @@ pub enum PacketBody {
     },
     /// Server-to-client API response.
     ApiResponse {
-        request_id: String,
+        request_id: u64,
         ok: bool,
         status: u16,
         data: Value,
-        #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<ErrorPayload>,
         metadata: Value,
     },
     /// Event emission in either direction.
     EventEmit {
-        event_id: String,
+        event_id: u64,
         name: String,
         data: Value,
         attachments: Vec<FileAttachment>,
         metadata: Value,
         expect_ack: bool,
+        /// Storage ID assigned by a database or other persistent store.
+        /// Serialized as `"si"` when present, omitted when `None`.
+        storage_id: Option<u64>,
     },
     /// Acknowledgement for an emitted event.
     EventAck {
-        event_id: String,
+        event_id: u64,
         ok: bool,
         receipt: Value,
-        #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<ErrorPayload>,
     },
+}
+
+// --- Manual Serialize: short keys + numeric `k` tag -------------------------
+
+impl Serialize for PacketBody {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::ApiRequest {
+                request_id,
+                route,
+                params,
+                attachments,
+                metadata,
+            } => {
+                let mut s = serializer.serialize_map(Some(6))?;
+                s.serialize_entry("k", &K_API_REQUEST)?;
+                s.serialize_entry("i", request_id)?;
+                s.serialize_entry("r", route)?;
+                s.serialize_entry("p", params)?;
+                s.serialize_entry("a", attachments)?;
+                s.serialize_entry("m", metadata)?;
+                s.end()
+            }
+            Self::ApiResponse {
+                request_id,
+                ok,
+                status,
+                data,
+                error,
+                metadata,
+            } => {
+                let field_count = 5 + usize::from(error.is_some()) + 1;
+                let mut s = serializer.serialize_map(Some(field_count))?;
+                s.serialize_entry("k", &K_API_RESPONSE)?;
+                s.serialize_entry("i", request_id)?;
+                s.serialize_entry("o", ok)?;
+                s.serialize_entry("s", status)?;
+                s.serialize_entry("d", data)?;
+                if let Some(err) = error {
+                    s.serialize_entry("er", err)?;
+                }
+                s.serialize_entry("m", metadata)?;
+                s.end()
+            }
+            Self::EventEmit {
+                event_id,
+                name,
+                data,
+                attachments,
+                metadata,
+                expect_ack,
+                storage_id,
+            } => {
+                let field_count = 7 + usize::from(storage_id.is_some());
+                let mut s = serializer.serialize_map(Some(field_count))?;
+                s.serialize_entry("k", &K_EVENT_EMIT)?;
+                s.serialize_entry("i", event_id)?;
+                s.serialize_entry("n", name)?;
+                s.serialize_entry("d", data)?;
+                s.serialize_entry("a", attachments)?;
+                s.serialize_entry("m", metadata)?;
+                s.serialize_entry("e", expect_ack)?;
+                if let Some(si) = storage_id {
+                    s.serialize_entry("si", si)?;
+                }
+                s.end()
+            }
+            Self::EventAck {
+                event_id,
+                ok,
+                receipt,
+                error,
+            } => {
+                let field_count = 3 + usize::from(error.is_some()) + 1;
+                let mut s = serializer.serialize_map(Some(field_count))?;
+                s.serialize_entry("k", &K_EVENT_ACK)?;
+                s.serialize_entry("i", event_id)?;
+                s.serialize_entry("o", ok)?;
+                s.serialize_entry("rc", receipt)?;
+                if let Some(err) = error {
+                    s.serialize_entry("er", err)?;
+                }
+                s.end()
+            }
+        }
+    }
+}
+
+// --- Manual Deserialize: read numeric `k`, dispatch to short-key fields -------
+
+/// Deserialization helper for [`PacketBody::ApiRequest`].
+#[derive(Deserialize)]
+struct ApiRequestFields {
+    #[serde(rename = "i")]
+    request_id: u64,
+    #[serde(rename = "r")]
+    route: String,
+    #[serde(rename = "p", default)]
+    params: Value,
+    #[serde(rename = "a", default)]
+    attachments: Vec<FileAttachment>,
+    #[serde(rename = "m", default)]
+    metadata: Value,
+}
+
+/// Deserialization helper for [`PacketBody::ApiResponse`].
+#[derive(Deserialize)]
+struct ApiResponseFields {
+    #[serde(rename = "i")]
+    request_id: u64,
+    #[serde(rename = "o", default)]
+    ok: bool,
+    #[serde(rename = "s", default)]
+    status: u16,
+    #[serde(rename = "d", default)]
+    data: Value,
+    #[serde(rename = "er", default)]
+    error: Option<ErrorPayload>,
+    #[serde(rename = "m", default)]
+    metadata: Value,
+}
+
+/// Deserialization helper for [`PacketBody::EventEmit`].
+#[derive(Deserialize)]
+struct EventEmitFields {
+    #[serde(rename = "i")]
+    event_id: u64,
+    #[serde(rename = "n")]
+    name: String,
+    #[serde(rename = "d", default)]
+    data: Value,
+    #[serde(rename = "a", default)]
+    attachments: Vec<FileAttachment>,
+    #[serde(rename = "m", default)]
+    metadata: Value,
+    #[serde(rename = "e", default)]
+    expect_ack: bool,
+    #[serde(rename = "si", default)]
+    storage_id: Option<u64>,
+}
+
+/// Deserialization helper for [`PacketBody::EventAck`].
+#[derive(Deserialize)]
+struct EventAckFields {
+    #[serde(rename = "i")]
+    event_id: u64,
+    #[serde(rename = "o", default)]
+    ok: bool,
+    #[serde(rename = "rc", default)]
+    receipt: Value,
+    #[serde(rename = "er", default)]
+    error: Option<ErrorPayload>,
+}
+
+impl<'de> Deserialize<'de> for PacketBody {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Parse into a generic JSON value first so we can inspect the numeric
+        // `k` discriminator, then dispatch to the appropriate short-key struct.
+        let value = Value::deserialize(deserializer)?;
+        let k = value.get("k").and_then(|v| v.as_u64()).ok_or_else(|| {
+            serde::de::Error::custom("missing or non-numeric 'k' field in packet body")
+        })?;
+        let k = u8::try_from(k).map_err(|_| {
+            serde::de::Error::custom(format!("'k' value {k} is outside the valid range"))
+        })?;
+
+        match k {
+            K_API_REQUEST => {
+                let f = serde_json::from_value::<ApiRequestFields>(value)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(Self::ApiRequest {
+                    request_id: f.request_id,
+                    route: f.route,
+                    params: f.params,
+                    attachments: f.attachments,
+                    metadata: f.metadata,
+                })
+            }
+            K_EVENT_EMIT => {
+                let f = serde_json::from_value::<EventEmitFields>(value)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(Self::EventEmit {
+                    event_id: f.event_id,
+                    name: f.name,
+                    data: f.data,
+                    attachments: f.attachments,
+                    metadata: f.metadata,
+                    expect_ack: f.expect_ack,
+                    storage_id: f.storage_id,
+                })
+            }
+            K_API_RESPONSE => {
+                let f = serde_json::from_value::<ApiResponseFields>(value)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(Self::ApiResponse {
+                    request_id: f.request_id,
+                    ok: f.ok,
+                    status: f.status,
+                    data: f.data,
+                    error: f.error,
+                    metadata: f.metadata,
+                })
+            }
+            K_EVENT_ACK => {
+                let f = serde_json::from_value::<EventAckFields>(value)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(Self::EventAck {
+                    event_id: f.event_id,
+                    ok: f.ok,
+                    receipt: f.receipt,
+                    error: f.error,
+                })
+            }
+            _ => Err(serde::de::Error::custom(format!("unknown 'k' value: {k}"))),
+        }
+    }
 }
 
 impl PacketBody {
@@ -215,10 +460,23 @@ impl PacketEnvelope {
 }
 
 /// Encodes and decodes WSCALL binary frames.
-#[derive(Debug, Clone, Default)]
+///
+/// The symmetric ciphers are constructed once when a key is configured and shared
+/// via [`Arc`] across every clone of the codec. This avoids redoing the key
+/// schedule (which for AES-256-GCM is especially expensive) on every frame.
+#[derive(Clone, Default)]
 pub struct FrameCodec {
-    aes256_key: Option<[u8; 32]>,
-    chacha20_key: Option<[u8; 32]>,
+    aes256_cipher: Option<Arc<Aes256Gcm>>,
+    chacha20_cipher: Option<Arc<ChaCha20Poly1305>>,
+}
+
+impl std::fmt::Debug for FrameCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrameCodec")
+            .field("aes256", &self.aes256_cipher.is_some())
+            .field("chacha20", &self.chacha20_cipher.is_some())
+            .finish()
+    }
 }
 
 impl FrameCodec {
@@ -228,26 +486,52 @@ impl FrameCodec {
     }
 
     /// Configures a ChaCha20-Poly1305 key.
-    pub fn with_chacha20_key(mut self, key: [u8; 32]) -> Self {
-        self.chacha20_key = Some(key);
-        self
+    ///
+    /// The cipher is constructed eagerly so that subsequent frame encoding never
+    /// pays for the key schedule again.
+    pub fn with_chacha20_key(self, key: [u8; 32]) -> Self {
+        let cipher = ChaCha20Poly1305::new_from_slice(&key)
+            .expect("a 32-byte key is always valid for ChaCha20-Poly1305");
+        Self {
+            chacha20_cipher: Some(Arc::new(cipher)),
+            ..self
+        }
     }
 
     /// Configures an AES256-GCM key.
-    pub fn with_aes256_key(mut self, key: [u8; 32]) -> Self {
-        self.aes256_key = Some(key);
-        self
+    ///
+    /// The cipher is constructed eagerly so that subsequent frame encoding never
+    /// pays for the AES key expansion again.
+    pub fn with_aes256_key(self, key: [u8; 32]) -> Self {
+        let cipher =
+            Aes256Gcm::new_from_slice(&key).expect("a 32-byte key is always valid for AES-256-GCM");
+        Self {
+            aes256_cipher: Some(Arc::new(cipher)),
+            ..self
+        }
     }
 
     /// Encodes an envelope into a binary WSCALL frame.
     pub fn encode(&self, packet: &PacketEnvelope) -> Result<Vec<u8>, ProtocolError> {
         let payload = serde_json::to_vec(&packet.body)?;
+
+        // Pre-check the serialized JSON size before doing any crypto work so
+        // that oversized payloads are rejected without paying for encryption.
+        if payload.len() > MAX_PAYLOAD_BYTES {
+            return Err(ProtocolError::PayloadTooLarge {
+                actual: payload.len(),
+                max: MAX_PAYLOAD_BYTES,
+            });
+        }
+
         let payload = match packet.encryption {
             EncryptionKind::None => payload,
             EncryptionKind::ChaCha20 => self.encrypt_chacha20(&payload)?,
             EncryptionKind::Aes256 => self.encrypt_aes256(&payload)?,
         };
 
+        // The encrypted form (nonce + ciphertext + tag) can still overflow the
+        // limit even when the plaintext fit, so guard once more.
         if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(ProtocolError::PayloadTooLarge {
                 actual: payload.len(),
@@ -286,10 +570,11 @@ impl FrameCodec {
 
         let message_type = MessageType::try_from(frame[4])?;
         let encryption = EncryptionKind::try_from(frame[5])?;
-        let payload = match encryption {
-            EncryptionKind::None => frame[6..].to_vec(),
-            EncryptionKind::ChaCha20 => self.decrypt_chacha20(&frame[6..])?,
-            EncryptionKind::Aes256 => self.decrypt_aes256(&frame[6..])?,
+        // Borrow the plaintext slice directly instead of cloning it into a Vec.
+        let payload: Cow<'_, [u8]> = match encryption {
+            EncryptionKind::None => Cow::Borrowed(&frame[6..]),
+            EncryptionKind::ChaCha20 => Cow::Owned(self.decrypt_chacha20(&frame[6..])?),
+            EncryptionKind::Aes256 => Cow::Owned(self.decrypt_aes256(&frame[6..])?),
         };
 
         let body: PacketBody = serde_json::from_slice(&payload)?;
@@ -305,11 +590,10 @@ impl FrameCodec {
     }
 
     fn encrypt_chacha20(&self, payload: &[u8]) -> Result<Vec<u8>, ProtocolError> {
-        let key = self
-            .chacha20_key
+        let cipher = self
+            .chacha20_cipher
+            .as_ref()
             .ok_or(ProtocolError::MissingEncryptionKey("chacha20"))?;
-        let cipher = ChaCha20Poly1305::new_from_slice(&key)
-            .map_err(|_| ProtocolError::InvalidEncryptionKey("chacha20"))?;
         let mut nonce_bytes = [0_u8; CHACHA20_NONCE_LEN];
         getrandom(&mut nonce_bytes).map_err(|source| ProtocolError::Random(source.to_string()))?;
         let ciphertext = cipher
@@ -331,11 +615,10 @@ impl FrameCodec {
             });
         }
 
-        let key = self
-            .chacha20_key
+        let cipher = self
+            .chacha20_cipher
+            .as_ref()
             .ok_or(ProtocolError::MissingEncryptionKey("chacha20"))?;
-        let cipher = ChaCha20Poly1305::new_from_slice(&key)
-            .map_err(|_| ProtocolError::InvalidEncryptionKey("chacha20"))?;
         let (nonce_bytes, ciphertext) = payload.split_at(CHACHA20_NONCE_LEN);
         cipher
             .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
@@ -343,11 +626,10 @@ impl FrameCodec {
     }
 
     fn encrypt_aes256(&self, payload: &[u8]) -> Result<Vec<u8>, ProtocolError> {
-        let key = self
-            .aes256_key
+        let cipher = self
+            .aes256_cipher
+            .as_ref()
             .ok_or(ProtocolError::MissingEncryptionKey("aes256"))?;
-        let cipher = Aes256Gcm::new_from_slice(&key)
-            .map_err(|_| ProtocolError::InvalidEncryptionKey("aes256"))?;
         let mut nonce_bytes = [0_u8; AES256_NONCE_LEN];
         getrandom(&mut nonce_bytes).map_err(|source| ProtocolError::Random(source.to_string()))?;
         let ciphertext = cipher
@@ -369,11 +651,10 @@ impl FrameCodec {
             });
         }
 
-        let key = self
-            .aes256_key
+        let cipher = self
+            .aes256_cipher
+            .as_ref()
             .ok_or(ProtocolError::MissingEncryptionKey("aes256"))?;
-        let cipher = Aes256Gcm::new_from_slice(&key)
-            .map_err(|_| ProtocolError::InvalidEncryptionKey("aes256"))?;
         let (nonce_bytes, ciphertext) = payload.split_at(AES256_NONCE_LEN);
         cipher
             .decrypt(AesNonce::from_slice(nonce_bytes), ciphertext)
@@ -445,7 +726,7 @@ mod tests {
     #[test]
     fn plaintext_helpers_still_work() {
         let packet = PacketEnvelope::new(PacketBody::EventAck {
-            event_id: "evt-1".to_string(),
+            event_id: 1,
             ok: true,
             receipt: json!({ "ok": true }),
             error: None,
@@ -461,7 +742,7 @@ mod tests {
         let codec = FrameCodec::plaintext().with_aes256_key(TEST_KEY);
         let packet = PacketEnvelope::with_encryption(
             PacketBody::ApiResponse {
-                request_id: "req-1".to_string(),
+                request_id: 1,
                 ok: true,
                 status: 200,
                 data: json!({ "message": "encrypted" }),
@@ -480,7 +761,7 @@ mod tests {
     fn encode_rejects_payloads_over_limit() {
         let codec = FrameCodec::plaintext();
         let packet = PacketEnvelope::new(PacketBody::ApiResponse {
-            request_id: "req-oversize".to_string(),
+            request_id: 999,
             ok: true,
             status: 200,
             data: json!({ "blob": "a".repeat(10 * 1024 * 1024) }),

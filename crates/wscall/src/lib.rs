@@ -7,7 +7,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! wscall = { version = "0.1.1", features = ["full"] }
+//! wscall = { version = "0.2.0", features = ["full"] }
 //! ```
 //!
 //! Use the `server` feature for `WscallServer`, the `client` feature for
@@ -38,8 +38,7 @@ pub mod client {
 #[cfg(feature = "server")]
 pub use wscall_server::{
     ApiContext, ApiError, EventContext, ExceptionContext, ServerConnectionContext,
-    ServerDisconnectContext, ServerError, ServerHandle, ValidateParams, WscallServer,
-    validation,
+    ServerDisconnectContext, ServerError, ServerHandle, ValidateParams, WscallServer, validation,
 };
 
 #[cfg(feature = "client")]

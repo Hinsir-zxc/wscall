@@ -35,6 +35,10 @@ Transport behavior:
 2. `ChaCha20` and `AES256` modes store `12-byte nonce + ciphertext` in `payload`.
 3. The payload limit is `10 * 1024 * 1024 - 6`, which keeps the full WSCALL frame within `10 MiB`.
 4. File parameters use JSON references plus inline Base64 attachments.
+5. The JSON envelope uses compact single-letter keys and a numeric `k` discriminator to minimize per-frame overhead.
+6. `request_id`/`event_id` are per-connection `u64` counters serialized as JSON numbers (1–6 bytes).
+7. `connection_id` uses UUIDv7 (time-ordered, generated once per connection).
+8. Events may carry an optional `si` (Storage ID) field for server-pushed persisted messages.
 
 ## Use As Crates
 
@@ -42,15 +46,15 @@ Depend on only what you need:
 
 ```toml
 [dependencies]
-wscall-server = "0.1.1"
-wscall-client = "0.1.1"
+wscall-server = "0.2.0"
+wscall-client = "0.2.0"
 ```
 
 Or use the facade crate:
 
 ```toml
 [dependencies]
-wscall = { version = "0.1.1", features = ["full"] }
+wscall = { version = "0.2.0", features = ["full"] }
 ```
 
 ## Quick Start
@@ -108,11 +112,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Client reconnect behavior:
 
-1. Unexpected disconnects trigger automatic reconnect attempts.
+1. Unexpected disconnects trigger automatic reconnect attempts (controlled by `auto_reconnect`, default `true`).
 2. The first retry waits 3 seconds.
-3. Each later retry increases the delay by 1 second.
+3. Each later retry doubles the delay (exponential backoff: 3s → 6s → 12s …).
 4. The retry delay is capped at 30 seconds.
-5. Calling `close()` stops reconnect attempts.
+5. A random sub-second jitter is added to each retry to avoid thundering-herd reconnect storms.
+6. Calling `close()` stops reconnect attempts.
+7. Use `WscallClient::connect_with_auto_reconnect(url, false)` to disable automatic reconnection.
 
 Runnable end-to-end quick start:
 
@@ -141,6 +147,18 @@ The demos exercise:
 3. `chat.message` event emit and broadcast.
 4. `chat.history` API query.
 5. End-to-end ChaCha20 frame encryption using the demo key wired in both examples.
+
+## Performance Highlights
+
+1. **Concurrent request handling**: each inbound API request/event runs in its own `tokio::spawn` task with a per-connection semaphore (default 64 in-flight), eliminating head-of-line blocking.
+2. **Zero-copy broadcast**: `broadcast_event` encodes the frame once and shares it as `Bytes` across all recipients.
+3. **Pre-encoded outbound**: all frames are encoded at dispatch time; the writer task only ships bytes.
+4. **Lock-free hot paths**: `DashMap` connection table, `ArcSwapOption` writer handle, `DashMap<u64>` pending correlation map.
+5. **Cached ciphers**: AES-256-GCM and ChaCha20-Poly1305 key schedules are computed once and shared via `Arc`.
+6. **Compact wire format**: single-letter JSON keys + numeric `k` tag + `u64` counters for IDs minimize per-frame byte overhead.
+7. **Low latency**: `TCP_NODELAY` on accept, `tracing` instead of `println!` on hot paths.
+
+See `framework-instruction.md` for the full architecture and performance model documentation.
 
 ## Quality Gates
 
@@ -171,7 +189,8 @@ Version history is tracked in `CHANGELOG.md`.
 
 ## Current Constraints
 
-1. `ChaCha20` and `AES256-GCM` are implemented in `FrameCodec`; the demos still default to `ChaCha20`.
+1. `ChaCha20` and `AES256-GCM` are implemented in `FrameCodec`; the demos default to `ChaCha20`.
 2. Attachments are inline Base64 and suited to small files.
 3. Large-file chunking is not part of the current core protocol.
 4. The published crate and code identifiers have been renamed to `wscall`.
+5. Client SDK is Rust-only; a JavaScript client is planned for a future release.

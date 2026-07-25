@@ -5,6 +5,10 @@ const DEMO_CHACHA20_KEY: [u8; 32] = [0x42; 32];
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
     let client =
         WscallClient::connect_with_chacha20("ws://127.0.0.1:9001/socket", DEMO_CHACHA20_KEY)
             .await?;

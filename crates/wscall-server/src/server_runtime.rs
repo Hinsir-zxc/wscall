@@ -2,13 +2,15 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures_util::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use uuid::Uuid;
@@ -25,6 +27,10 @@ use crate::server_types::{
 const SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const SERVER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const SERVER_OUTBOUND_QUEUE_CAPACITY: usize = 256;
+/// Default cap on concurrently in-flight request/event handlers per connection.
+const SERVER_DEFAULT_MAX_IN_FLIGHT: usize = 64;
+/// Grace window given to the writer task to flush a close frame before abort.
+const SERVER_CLOSE_GRACE: Duration = Duration::from_millis(500);
 
 type ApiHandler =
     Arc<dyn Fn(ApiContext) -> BoxFuture<'static, Result<Value, ApiError>> + Send + Sync>;
@@ -32,13 +38,15 @@ type Filter =
     Arc<dyn Fn(ApiContext) -> BoxFuture<'static, Result<ApiContext, ApiError>> + Send + Sync>;
 type EventHandler =
     Arc<dyn Fn(EventContext) -> BoxFuture<'static, Result<Value, ApiError>> + Send + Sync>;
-type ConnectionHandler = Arc<dyn Fn(ServerConnectionContext) -> BoxFuture<'static, ()> + Send + Sync>;
-type DisconnectHandler = Arc<dyn Fn(ServerDisconnectContext) -> BoxFuture<'static, ()> + Send + Sync>;
+type ConnectionHandler =
+    Arc<dyn Fn(ServerConnectionContext) -> BoxFuture<'static, ()> + Send + Sync>;
+type DisconnectHandler =
+    Arc<dyn Fn(ServerDisconnectContext) -> BoxFuture<'static, ()> + Send + Sync>;
 type ExceptionHandler =
     Arc<dyn Fn(ExceptionContext) -> BoxFuture<'static, ErrorPayload> + Send + Sync>;
 
 struct ApiRequestInput {
-    request_id: String,
+    request_id: u64,
     route: String,
     params: Value,
     attachments: Vec<FileAttachment>,
@@ -46,44 +54,86 @@ struct ApiRequestInput {
 }
 
 struct EventEmitInput {
-    event_id: String,
+    event_id: u64,
     name: String,
     data: Value,
     attachments: Vec<FileAttachment>,
     metadata: Value,
+    storage_id: Option<u64>,
 }
 
 impl ServerHandle {
+    /// Broadcasts an event to every live connection.
+    ///
+    /// The frame is encoded exactly once and shared as [`Bytes`] across all
+    /// recipients, so the cost no longer scales with the connection count times
+    /// the payload size. A full outbound queue for a single connection drops
+    /// that one delivery instead of failing the whole broadcast.
     pub async fn broadcast_event(
         &self,
         name: impl Into<String>,
         data: Value,
         attachments: Vec<FileAttachment>,
     ) -> Result<(), ApiError> {
+        self.broadcast_event_inner(name, data, attachments, None)
+            .await
+    }
+
+    /// Broadcasts a persisted event to every live connection, carrying a
+    /// storage id (`si` field) assigned by a database or other persistent store.
+    pub async fn broadcast_persisted_event(
+        &self,
+        name: impl Into<String>,
+        data: Value,
+        attachments: Vec<FileAttachment>,
+        storage_id: u64,
+    ) -> Result<(), ApiError> {
+        self.broadcast_event_inner(name, data, attachments, Some(storage_id))
+            .await
+    }
+
+    async fn broadcast_event_inner(
+        &self,
+        name: impl Into<String>,
+        data: Value,
+        attachments: Vec<FileAttachment>,
+        storage_id: Option<u64>,
+    ) -> Result<(), ApiError> {
+        let event_id = self.state.next_event_id.fetch_add(1, Ordering::Relaxed) + 1;
         let packet = PacketEnvelope::with_encryption(
             PacketBody::EventEmit {
-                event_id: Uuid::new_v4().to_string(),
+                event_id,
                 name: name.into(),
                 data,
                 attachments,
                 metadata: json!({ "source": "server" }),
                 expect_ack: true,
+                storage_id,
             },
             self.default_encryption,
         );
 
-        let clients = self.state.clients.read().await;
-        let senders = clients.values().cloned().collect::<Vec<_>>();
-        drop(clients);
+        let encoded = self
+            .codec
+            .encode(&packet)
+            .map_err(|_| ApiError::internal("failed to encode broadcast event"))?;
+        let encoded = Bytes::from(encoded);
 
-        for sender in senders {
-            sender
-                .try_send(ServerOutbound::Packet(packet.clone()))
-                .map_err(|_| ApiError::internal("failed to queue broadcast event"))?;
+        for entry in self.state.clients.iter() {
+            if entry
+                .value()
+                .try_send(ServerOutbound::PreEncoded(encoded.clone()))
+                .is_err()
+            {
+                tracing::warn!("broadcast: outbound queue full, dropping event for a connection");
+            }
         }
         Ok(())
     }
 
+    /// Sends an event to a single connection by id.
+    ///
+    /// The frame is pre-encoded once so the writer task only ships bytes.
     pub async fn send_event_to(
         &self,
         connection_id: &str,
@@ -91,31 +141,65 @@ impl ServerHandle {
         data: Value,
         attachments: Vec<FileAttachment>,
     ) -> Result<(), ApiError> {
+        self.send_event_to_inner(connection_id, name, data, attachments, None)
+            .await
+    }
+
+    /// Sends a persisted event to a single connection by id, carrying a
+    /// storage id (`si` field) assigned by a database or other persistent store.
+    pub async fn send_persisted_event_to(
+        &self,
+        connection_id: &str,
+        name: impl Into<String>,
+        data: Value,
+        attachments: Vec<FileAttachment>,
+        storage_id: u64,
+    ) -> Result<(), ApiError> {
+        self.send_event_to_inner(connection_id, name, data, attachments, Some(storage_id))
+            .await
+    }
+
+    async fn send_event_to_inner(
+        &self,
+        connection_id: &str,
+        name: impl Into<String>,
+        data: Value,
+        attachments: Vec<FileAttachment>,
+        storage_id: Option<u64>,
+    ) -> Result<(), ApiError> {
+        let event_id = self.state.next_event_id.fetch_add(1, Ordering::Relaxed) + 1;
         let packet = PacketEnvelope::with_encryption(
             PacketBody::EventEmit {
-                event_id: Uuid::new_v4().to_string(),
+                event_id,
                 name: name.into(),
                 data,
                 attachments,
                 metadata: json!({ "source": "server" }),
                 expect_ack: true,
+                storage_id,
             },
             self.default_encryption,
         );
 
-        let clients = self.state.clients.read().await;
-        let sender = clients
+        let encoded = self
+            .codec
+            .encode(&packet)
+            .map_err(|_| ApiError::internal("failed to encode direct event"))?;
+        let encoded = Bytes::from(encoded);
+
+        let entry = self
+            .state
+            .clients
             .get(connection_id)
-            .cloned()
             .ok_or_else(|| ApiError::not_found("target connection not found"))?;
-        drop(clients);
-        sender
-            .try_send(ServerOutbound::Packet(packet))
+        entry
+            .try_send(ServerOutbound::PreEncoded(encoded))
             .map_err(|_| ApiError::internal("failed to queue direct event"))
     }
 
+    /// Returns the current number of live connections.
     pub async fn connection_count(&self) -> usize {
-        self.state.clients.read().await.len()
+        self.state.clients.len()
     }
 }
 
@@ -129,6 +213,10 @@ pub struct WscallServer {
     exception_handler: Option<ExceptionHandler>,
     codec: FrameCodec,
     default_encryption: EncryptionKind,
+    /// Optional global cap on concurrent accepted connections.
+    max_connections: Option<usize>,
+    /// Per-connection cap on concurrently running request/event handlers.
+    max_in_flight: usize,
 }
 
 impl Default for WscallServer {
@@ -140,9 +228,7 @@ impl Default for WscallServer {
 impl WscallServer {
     pub fn new() -> Self {
         Self {
-            state: Arc::new(ServerState {
-                clients: RwLock::new(HashMap::new()),
-            }),
+            state: Arc::new(ServerState::new()),
             routes: HashMap::new(),
             filters: Vec::new(),
             event_handlers: HashMap::new(),
@@ -151,6 +237,8 @@ impl WscallServer {
             exception_handler: None,
             codec: FrameCodec::plaintext(),
             default_encryption: EncryptionKind::None,
+            max_connections: None,
+            max_in_flight: SERVER_DEFAULT_MAX_IN_FLIGHT,
         }
     }
 
@@ -166,9 +254,27 @@ impl WscallServer {
         self
     }
 
+    /// Caps the number of concurrently accepted connections.
+    ///
+    /// When the cap is reached, new `accept` calls block until an existing
+    /// connection drops, providing natural backpressure against connection
+    /// flooding instead of spawning unbounded tasks.
+    pub fn with_max_connections(mut self, max: usize) -> Self {
+        self.max_connections = Some(max);
+        self
+    }
+
+    /// Caps the number of concurrently in-flight request/event handlers per
+    /// single connection, bounding per-connection CPU and memory usage.
+    pub fn with_max_in_flight(mut self, max: usize) -> Self {
+        self.max_in_flight = max;
+        self
+    }
+
     pub fn handle(&self) -> ServerHandle {
         ServerHandle {
             state: Arc::clone(&self.state),
+            codec: self.codec.clone(),
             default_encryption: self.default_encryption,
         }
     }
@@ -274,15 +380,34 @@ impl WscallServer {
 
     pub async fn listen(self, address: &str) -> Result<(), ServerError> {
         let listener = TcpListener::bind(address).await?;
-        println!("WSCALL server listening on ws://{address}/socket");
+        tracing::info!(%address, "wscall server listening on ws://{address}/socket");
 
         let shared = Arc::new(self);
+        let conn_sem = shared
+            .max_connections
+            .map(|max| Arc::new(Semaphore::new(max)));
+
         loop {
+            // Acquire a connection permit (when capped) before accepting so a
+            // connection flood turns into backpressure rather than unbounded
+            // task spawning.
+            let permit = match &conn_sem {
+                Some(sem) => match sem.clone().acquire_owned().await {
+                    Ok(permit) => Some(permit),
+                    Err(_) => continue,
+                },
+                None => None,
+            };
+
             let (stream, peer) = listener.accept().await?;
+            // Disable Nagle's algorithm for low-latency RPC frames.
+            let _ = TcpStream::set_nodelay(&stream, true);
+
             let server = Arc::clone(&shared);
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(error) = server.serve_connection(stream, peer).await {
-                    eprintln!("connection {peer:?} failed: {error}");
+                    tracing::warn!(?error, ?peer, "connection failed");
                 }
             });
         }
@@ -294,56 +419,50 @@ impl WscallServer {
         peer: std::net::SocketAddr,
     ) -> Result<(), ServerError> {
         let websocket = accept_async(stream).await?;
-        let connection_id = Uuid::new_v4().to_string();
+        let connection_id = Uuid::now_v7().to_string();
         let (mut sink, mut stream) = websocket.split();
         let (tx, mut rx) = mpsc::channel::<ServerOutbound>(SERVER_OUTBOUND_QUEUE_CAPACITY);
+        let peer_addr = Some(peer);
 
-        self.state
-            .clients
-            .write()
-            .await
-            .insert(connection_id.clone(), tx.clone());
+        self.state.clients.insert(connection_id.clone(), tx.clone());
 
-        self.notify_connected(&connection_id, Some(peer)).await;
+        self.notify_connected(&connection_id, peer_addr).await;
 
-        let codec = self.codec.clone();
-        let writer = tokio::spawn(async move {
-            while let Some(outbound) = rx.recv().await {
-                match outbound {
-                    ServerOutbound::Packet(packet) => {
-                        let bytes = codec.encode(&packet)?;
-                        sink.send(Message::Binary(bytes)).await?;
-                    }
-                    ServerOutbound::Ping(payload) => {
-                        sink.send(Message::Ping(payload)).await?;
-                    }
-                    ServerOutbound::Pong(payload) => {
-                        sink.send(Message::Pong(payload)).await?;
-                    }
-                    ServerOutbound::Close => {
-                        let _ = sink.send(Message::Close(None)).await;
-                        break;
-                    }
-                }
-            }
-            Ok::<(), ServerError>(())
-        });
-
-        let heartbeat_tx = tx.clone();
-        let heartbeat = tokio::spawn(async move {
+        let mut writer = tokio::spawn(async move {
             let mut ticker = interval(SERVER_HEARTBEAT_INTERVAL);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
-                ticker.tick().await;
-                if heartbeat_tx
-                    .send(ServerOutbound::Ping(Vec::new()))
-                    .await
-                    .is_err()
-                {
-                    break;
+                tokio::select! {
+                    maybe_outbound = rx.recv() => {
+                        let Some(outbound) = maybe_outbound else {
+                            break Ok::<(), ServerError>(());
+                        };
+                        match outbound {
+                            ServerOutbound::PreEncoded(bytes) => {
+                                sink.send(Message::Binary(bytes.to_vec())).await?;
+                            }
+                            ServerOutbound::Pong(payload) => {
+                                sink.send(Message::Pong(payload)).await?;
+                            }
+                            ServerOutbound::Close => {
+                                let _ = sink.send(Message::Close(None)).await;
+                                break Ok(());
+                            }
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        if let Err(error) = sink.send(Message::Ping(Vec::new())).await {
+                            break Err(ServerError::WebSocket(error));
+                        }
+                    }
                 }
             }
         });
+
+        // Per-connection concurrency limit for handler execution. The reader
+        // stays non-blocking under normal load; under overload it pauses reading
+        // new frames, which is the desired backpressure signal.
+        let in_flight = Arc::new(Semaphore::new(self.max_in_flight));
 
         let result = async {
             self.handle()
@@ -367,8 +486,32 @@ impl WscallServer {
                 match message? {
                     Message::Binary(bytes) => {
                         let packet = self.codec.decode(&bytes)?;
-                        self.process_packet(&connection_id, Some(peer), packet)
-                            .await?;
+
+                        let spawn_handler = matches!(
+                            &packet.body,
+                            PacketBody::ApiRequest { .. } | PacketBody::EventEmit { .. }
+                        );
+
+                        if spawn_handler {
+                            let permit = in_flight.clone().acquire_owned().await.map_err(|_| {
+                                ServerError::Api(ApiError::internal("in-flight semaphore closed"))
+                            })?;
+                            let server = Arc::clone(&self);
+                            let conn_id = connection_id.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                if let Err(error) =
+                                    server.process_packet(&conn_id, peer_addr, packet).await
+                                {
+                                    tracing::warn!(%error, "packet processing failed");
+                                }
+                            });
+                        } else {
+                            // Trivial control messages (acks / responses from
+                            // clients) are handled inline without spawning.
+                            self.process_packet(&connection_id, peer_addr, packet)
+                                .await?;
+                        }
                     }
                     Message::Close(_) => break Ok(()),
                     Message::Ping(payload) => {
@@ -388,16 +531,15 @@ impl WscallServer {
         }
         .await;
 
-        self.state.clients.write().await.remove(&connection_id);
-        let _ = tx.send(ServerOutbound::Close).await;
-        heartbeat.abort();
+        // Teardown: remove from the live table, attempt a graceful close, then
+        // abort the writer. Aborting the writer drops the channel receiver so
+        // any in-flight handler `queue_for` calls fail fast instead of hanging.
+        self.state.clients.remove(&connection_id);
+        let _ = tx.try_send(ServerOutbound::Close);
+        let _ = timeout(SERVER_CLOSE_GRACE, &mut writer).await;
         writer.abort();
-        self.notify_disconnected(
-            &connection_id,
-            Some(peer),
-            Self::disconnect_reason(&result),
-        )
-        .await;
+        self.notify_disconnected(&connection_id, peer_addr, Self::disconnect_reason(&result))
+            .await;
         result
     }
 
@@ -420,7 +562,7 @@ impl WscallServer {
                         connection_id,
                         peer_addr,
                         ApiRequestInput {
-                            request_id: request_id.clone(),
+                            request_id,
                             route,
                             params,
                             attachments,
@@ -436,6 +578,7 @@ impl WscallServer {
                 data,
                 attachments,
                 metadata,
+                storage_id,
                 ..
             } => {
                 let ack = self
@@ -443,11 +586,12 @@ impl WscallServer {
                         connection_id,
                         peer_addr,
                         EventEmitInput {
-                            event_id: event_id.clone(),
+                            event_id,
                             name,
                             data,
                             attachments,
                             metadata,
+                            storage_id,
                         },
                     )
                     .await;
@@ -459,9 +603,13 @@ impl WscallServer {
                 receipt,
                 error,
             } => {
-                println!(
-                    "received event ack from {} for {}: ok={}, receipt={}, error={:?}",
-                    connection_id, event_id, ok, receipt, error
+                tracing::debug!(
+                    connection_id,
+                    event_id,
+                    ok,
+                    ?receipt,
+                    ?error,
+                    "received event ack from client",
                 );
             }
             PacketBody::ApiResponse { .. } => {}
@@ -469,27 +617,34 @@ impl WscallServer {
         Ok(())
     }
 
+    /// Queues a response packet for a connection.
+    ///
+    /// The frame is pre-encoded here (offloading the writer task and enabling
+    /// parallel encoding across concurrent handlers) and sent with backpressure
+    /// semantics: a slow consumer pauses the producer rather than being dropped.
     async fn queue_for(
         &self,
         connection_id: &str,
         packet: PacketEnvelope,
     ) -> Result<(), ServerError> {
-        let clients = self.state.clients.read().await;
-        let sender = clients
-            .get(connection_id)
-            .cloned()
-            .ok_or_else(|| ServerError::Api(ApiError::not_found("connection is closed")))?;
-        drop(clients);
+        let encoded = self.codec.encode(&packet)?;
+        let encoded = Bytes::from(encoded);
+
+        // Clone the sender out of the DashMap guard before awaiting so the
+        // shard lock is never held across an await point.
+        let sender = match self.state.clients.get(connection_id) {
+            Some(entry) => entry.clone(),
+            None => {
+                return Err(ServerError::Api(ApiError::not_found(
+                    "connection is closed",
+                )));
+            }
+        };
+
         sender
-            .try_send(ServerOutbound::Packet(packet))
-            .map_err(|error| match error {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                    ServerError::OutboundQueueFull(connection_id.to_string())
-                }
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                    ServerError::Api(ApiError::internal("failed to queue outbound packet"))
-                }
-            })
+            .send(ServerOutbound::PreEncoded(encoded))
+            .await
+            .map_err(|_| ServerError::Api(ApiError::internal("failed to queue outbound packet")))
     }
 
     async fn run_api_request(
@@ -509,7 +664,7 @@ impl WscallServer {
         let mut ctx = ApiContext {
             connection_id: connection_id.to_string(),
             peer_addr,
-            request_id: request_id.clone(),
+            request_id,
             route: route.clone(),
             params,
             attachments,
@@ -579,16 +734,18 @@ impl WscallServer {
             data,
             attachments,
             metadata,
+            storage_id,
         } = event;
 
         let ctx = EventContext {
             connection_id: connection_id.to_string(),
             peer_addr,
-            event_id: event_id.clone(),
+            event_id,
             name: name.clone(),
             data,
             attachments,
             metadata,
+            storage_id,
             server: self.handle(),
         };
 
@@ -616,13 +773,13 @@ impl WscallServer {
             ),
             Ok(Err(error)) => PacketEnvelope::with_encryption(
                 PacketBody::EventAck {
-                    event_id: event_id.clone(),
+                    event_id,
                     ok: false,
                     receipt: json!({}),
                     error: Some(
                         self.map_exception(ExceptionContext {
                             connection_id: connection_id.to_string(),
-                            request_id: Some(event_id.clone()),
+                            request_id: Some(event_id),
                             target: name,
                             message_kind: "event",
                             error,
@@ -634,13 +791,13 @@ impl WscallServer {
             ),
             Err(_) => PacketEnvelope::with_encryption(
                 PacketBody::EventAck {
-                    event_id: event_id.clone(),
+                    event_id,
                     ok: false,
                     receipt: json!({}),
                     error: Some(
                         self.map_exception(ExceptionContext {
                             connection_id: connection_id.to_string(),
-                            request_id: Some(event_id.clone()),
+                            request_id: Some(event_id),
                             target: name,
                             message_kind: "event",
                             error: ApiError::internal("event handler panicked"),
@@ -656,16 +813,16 @@ impl WscallServer {
     async fn api_error_packet(
         &self,
         connection_id: &str,
-        request_id: Option<String>,
+        request_id: Option<u64>,
         route: String,
         error: ApiError,
     ) -> PacketEnvelope {
-        let request_id = request_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let request_id = request_id.unwrap_or(0);
         let status = error.status;
         let payload = self
             .map_exception(ExceptionContext {
                 connection_id: connection_id.to_string(),
-                request_id: Some(request_id.clone()),
+                request_id: Some(request_id),
                 target: route,
                 message_kind: "api",
                 error,
@@ -685,11 +842,7 @@ impl WscallServer {
         )
     }
 
-    async fn notify_connected(
-        &self,
-        connection_id: &str,
-        peer_addr: Option<std::net::SocketAddr>,
-    ) {
+    async fn notify_connected(&self, connection_id: &str, peer_addr: Option<std::net::SocketAddr>) {
         let handlers = self.connection_handlers.clone();
         for handler in handlers {
             let context = ServerConnectionContext {
@@ -698,8 +851,12 @@ impl WscallServer {
                 server: self.handle(),
             };
 
-            if AssertUnwindSafe(handler(context)).catch_unwind().await.is_err() {
-                eprintln!("server connected handler panicked");
+            if AssertUnwindSafe(handler(context))
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                tracing::error!("server connected handler panicked");
             }
         }
     }
@@ -719,8 +876,12 @@ impl WscallServer {
                 server: self.handle(),
             };
 
-            if AssertUnwindSafe(handler(context)).catch_unwind().await.is_err() {
-                eprintln!("server disconnected handler panicked");
+            if AssertUnwindSafe(handler(context))
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                tracing::error!("server disconnected handler panicked");
             }
         }
     }

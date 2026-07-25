@@ -16,10 +16,12 @@ categories = ["network-programming", "web-programming::websocket", "asynchronous
 all-features = true
 
 [dependencies]
+arc-swap.workspace = true
+dashmap.workspace = true
 futures-util.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
-uuid.workspace = true
-wscall-protocol = { path = "../wscall-protocol", version = "0.1.1" }
+tracing.workspace = true
+wscall-protocol = { path = "../wscall-protocol", version = "0.2.0" }

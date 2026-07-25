@@ -1,32 +1,58 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
+use bytes::Bytes;
+use dashmap::DashMap;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use validator::Validate;
-use wscall_protocol::{
-    EncryptionKind, ErrorPayload, FileAttachment, PacketEnvelope, ProtocolError,
-};
+use wscall_protocol::{EncryptionKind, ErrorPayload, FileAttachment, FrameCodec, ProtocolError};
 
 use crate::validation;
 
 pub(crate) enum ServerOutbound {
-    Packet(PacketEnvelope),
-    Ping(Vec<u8>),
+    /// Pre-encoded frame bytes. All push/response paths encode once up front
+    /// (often enabling parallel encoding across concurrent handlers) and the
+    /// writer task only ships bytes, which keeps the writer cheap and shared
+    /// across recipients for broadcasts.
+    PreEncoded(Bytes),
     Pong(Vec<u8>),
     Close,
 }
 
+/// Shared, lock-free table of live client outbound channels.
 pub(crate) struct ServerState {
-    pub clients: RwLock<std::collections::HashMap<String, mpsc::Sender<ServerOutbound>>>,
+    pub clients: DashMap<String, mpsc::Sender<ServerOutbound>>,
+    /// Per-server event id counter for server-originated events.
+    pub next_event_id: AtomicU64,
+}
+
+impl ServerState {
+    pub fn new() -> Self {
+        Self {
+            clients: DashMap::new(),
+            next_event_id: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for ServerState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Handle that can be cloned into request and event handlers for server push operations.
+///
+/// Carries a clone of the [`FrameCodec`] so that push operations can pre-encode
+/// frames once and avoid per-recipient work in the writer task.
 #[derive(Clone)]
 pub struct ServerHandle {
     pub(crate) state: Arc<ServerState>,
+    pub(crate) codec: FrameCodec,
     pub(crate) default_encryption: EncryptionKind,
 }
 
@@ -101,7 +127,7 @@ impl ServerDisconnectContext {
 pub struct ApiContext {
     pub(crate) connection_id: String,
     pub(crate) peer_addr: Option<SocketAddr>,
-    pub(crate) request_id: String,
+    pub(crate) request_id: u64,
     pub(crate) route: String,
     pub(crate) params: Value,
     pub(crate) attachments: Vec<FileAttachment>,
@@ -131,8 +157,8 @@ impl ApiContext {
     }
 
     /// Returns the request correlation id.
-    pub fn request_id(&self) -> &str {
-        &self.request_id
+    pub fn request_id(&self) -> u64 {
+        self.request_id
     }
 
     /// Returns the matched route name.
@@ -225,11 +251,12 @@ impl ApiContext {
 pub struct EventContext {
     pub(crate) connection_id: String,
     pub(crate) peer_addr: Option<SocketAddr>,
-    pub(crate) event_id: String,
+    pub(crate) event_id: u64,
     pub(crate) name: String,
     pub(crate) data: Value,
     pub(crate) attachments: Vec<FileAttachment>,
     pub(crate) metadata: Value,
+    pub(crate) storage_id: Option<u64>,
     pub(crate) server: ServerHandle,
 }
 
@@ -250,8 +277,8 @@ impl EventContext {
     }
 
     /// Returns the event correlation id.
-    pub fn event_id(&self) -> &str {
-        &self.event_id
+    pub fn event_id(&self) -> u64 {
+        self.event_id
     }
 
     /// Returns the event name.
@@ -274,6 +301,11 @@ impl EventContext {
         &self.metadata
     }
 
+    /// Returns the storage id when the event carries one.
+    pub fn storage_id(&self) -> Option<u64> {
+        self.storage_id
+    }
+
     /// Returns a server handle for outbound event operations.
     pub fn server(&self) -> &ServerHandle {
         &self.server
@@ -284,7 +316,7 @@ impl EventContext {
 #[derive(Clone)]
 pub struct ExceptionContext {
     pub connection_id: String,
-    pub request_id: Option<String>,
+    pub request_id: Option<u64>,
     pub target: String,
     pub message_kind: &'static str,
     pub error: ApiError,

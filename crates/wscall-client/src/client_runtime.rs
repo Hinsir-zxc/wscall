@@ -1,16 +1,19 @@
-use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures_util::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
+use arc_swap::ArcSwapOption;
+use dashmap::DashMap;
+use futures_util::{
+    FutureExt, SinkExt, StreamExt,
+    future::{BoxFuture, join_all},
+};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use uuid::Uuid;
 use wscall_protocol::{
     EncryptionKind, ErrorPayload, FileAttachment, FrameCodec, PacketBody, PacketEnvelope,
 };
@@ -21,10 +24,14 @@ use crate::client_types::{
 
 type EventHandler = Arc<dyn Fn(EventMessage) -> BoxFuture<'static, Value> + Send + Sync>;
 type ConnectionHandler = Arc<dyn Fn(ClientConnectionEvent) -> BoxFuture<'static, ()> + Send + Sync>;
-type DisconnectHandler =
-    Arc<dyn Fn(ClientDisconnectEvent) -> BoxFuture<'static, ()> + Send + Sync>;
+type DisconnectHandler = Arc<dyn Fn(ClientDisconnectEvent) -> BoxFuture<'static, ()> + Send + Sync>;
 type PendingSender = oneshot::Sender<Result<Value, ClientError>>;
-type PendingMap = Arc<Mutex<HashMap<String, PendingSender>>>;
+/// Lock-free table of in-flight request/event correlations.
+///
+/// Replacing the previous `Mutex<HashMap>` removes the single contention point
+/// that serialized every concurrent `call`/`send_event` and every inbound
+/// response dispatch.
+type PendingMap = Arc<DashMap<u64, PendingSender>>;
 
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const CLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -36,22 +43,51 @@ const CLIENT_RECONNECT_MAX_DELAY_SECS: u64 = 30;
 pub struct WscallClient {
     url: Arc<str>,
     codec: FrameCodec,
-    writer: Arc<RwLock<Option<mpsc::Sender<ClientOutbound>>>>,
+    /// Lockless outbound channel handle. Reads via `load_full` never block, so
+    /// `send_outbound` no longer takes a read lock and clones an `Option` per call.
+    writer: Arc<ArcSwapOption<mpsc::Sender<ClientOutbound>>>,
     pending_api: PendingMap,
     pending_event: PendingMap,
-    event_handlers: Arc<RwLock<HashMap<String, Vec<EventHandler>>>>,
+    event_handlers: Arc<RwLock<std::collections::HashMap<String, Vec<EventHandler>>>>,
     connected_handlers: Arc<RwLock<Vec<ConnectionHandler>>>,
     disconnected_handlers: Arc<RwLock<Vec<DisconnectHandler>>>,
     default_timeout: Duration,
     default_encryption: EncryptionKind,
+    /// Whether the supervisor should automatically reconnect after an
+    /// unexpected disconnect. Defaults to `true`; set to `false` for
+    /// fire-and-forget or externally-managed connection lifecycles.
+    auto_reconnect: bool,
     is_connected: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     connection_generation: Arc<AtomicU64>,
+    /// Per-connection request id counter (starts at 1).
+    next_request_id: Arc<AtomicU64>,
+    /// Per-connection event id counter (starts at 1).
+    next_event_id: Arc<AtomicU64>,
 }
 
 impl WscallClient {
     pub async fn connect(url: &str) -> Result<Self, ClientError> {
-        Self::connect_with_settings(url, FrameCodec::plaintext(), EncryptionKind::None).await
+        Self::connect_with_settings(url, FrameCodec::plaintext(), EncryptionKind::None, true).await
+    }
+
+    /// Connect with explicit control over auto-reconnect behavior.
+    ///
+    /// When `auto_reconnect` is `false`, the client connects once and does not
+    /// retry after an unexpected disconnect — the caller is responsible for any
+    /// reconnection logic. When `true` (the default for [`connect`]), the
+    /// supervisor re-establishes the session with exponential backoff + jitter.
+    pub async fn connect_with_auto_reconnect(
+        url: &str,
+        auto_reconnect: bool,
+    ) -> Result<Self, ClientError> {
+        Self::connect_with_settings(
+            url,
+            FrameCodec::plaintext(),
+            EncryptionKind::None,
+            auto_reconnect,
+        )
+        .await
     }
 
     pub async fn connect_with_chacha20(url: &str, key: [u8; 32]) -> Result<Self, ClientError> {
@@ -59,6 +95,7 @@ impl WscallClient {
             url,
             FrameCodec::plaintext().with_chacha20_key(key),
             EncryptionKind::ChaCha20,
+            true,
         )
         .await
     }
@@ -68,6 +105,7 @@ impl WscallClient {
             url,
             FrameCodec::plaintext().with_aes256_key(key),
             EncryptionKind::Aes256,
+            true,
         )
         .await
     }
@@ -76,21 +114,25 @@ impl WscallClient {
         url: &str,
         codec: FrameCodec,
         default_encryption: EncryptionKind,
+        auto_reconnect: bool,
     ) -> Result<Self, ClientError> {
         let client = Self {
             url: Arc::<str>::from(url),
             codec,
-            writer: Arc::new(RwLock::new(None)),
-            pending_api: Arc::new(Mutex::new(HashMap::new())),
-            pending_event: Arc::new(Mutex::new(HashMap::new())),
-            event_handlers: Arc::new(RwLock::new(HashMap::new())),
+            writer: Arc::new(ArcSwapOption::new(None)),
+            pending_api: Arc::new(DashMap::new()),
+            pending_event: Arc::new(DashMap::new()),
+            event_handlers: Arc::new(RwLock::new(std::collections::HashMap::new())),
             connected_handlers: Arc::new(RwLock::new(Vec::new())),
             disconnected_handlers: Arc::new(RwLock::new(Vec::new())),
             default_timeout: Duration::from_secs(10),
             default_encryption,
+            auto_reconnect,
             is_connected: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(AtomicBool::new(false)),
             connection_generation: Arc::new(AtomicU64::new(0)),
+            next_request_id: Arc::new(AtomicU64::new(0)),
+            next_event_id: Arc::new(AtomicU64::new(0)),
         };
 
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -134,7 +176,10 @@ impl WscallClient {
             Box::pin(handler(event)) as BoxFuture<'static, ()>
         });
 
-        self.connected_handlers.write().await.push(Arc::clone(&handler));
+        self.connected_handlers
+            .write()
+            .await
+            .push(Arc::clone(&handler));
 
         if self.is_connected() {
             self.invoke_connection_handler(
@@ -168,14 +213,14 @@ impl WscallClient {
             return Err(ClientError::Disconnected);
         }
 
-        let request_id = Uuid::new_v4().to_string();
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
         let route = route.into();
         let (tx, rx) = oneshot::channel();
-        self.pending_api.lock().await.insert(request_id.clone(), tx);
+        self.pending_api.insert(request_id, tx);
         if self
             .send_outbound(ClientOutbound::Packet(PacketEnvelope::with_encryption(
                 PacketBody::ApiRequest {
-                    request_id: request_id.clone(),
+                    request_id,
                     route,
                     params,
                     attachments,
@@ -186,14 +231,14 @@ impl WscallClient {
             .await
             .is_err()
         {
-            self.pending_api.lock().await.remove(&request_id);
+            self.pending_api.remove(&request_id);
             return Err(ClientError::Disconnected);
         }
 
         match timeout(self.default_timeout, rx).await {
             Ok(result) => result.map_err(|_| ClientError::Disconnected)?,
             Err(_) => {
-                self.pending_api.lock().await.remove(&request_id);
+                self.pending_api.remove(&request_id);
                 Err(ClientError::Timeout)
             }
         }
@@ -209,32 +254,33 @@ impl WscallClient {
             return Err(ClientError::Disconnected);
         }
 
-        let event_id = Uuid::new_v4().to_string();
+        let event_id = self.next_event_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = oneshot::channel();
-        self.pending_event.lock().await.insert(event_id.clone(), tx);
+        self.pending_event.insert(event_id, tx);
         if self
             .send_outbound(ClientOutbound::Packet(PacketEnvelope::with_encryption(
                 PacketBody::EventEmit {
-                    event_id: event_id.clone(),
+                    event_id,
                     name: name.into(),
                     data,
                     attachments,
                     metadata: json!({ "client_name": "rust-demo" }),
                     expect_ack: true,
+                    storage_id: None,
                 },
                 self.default_encryption,
             )))
             .await
             .is_err()
         {
-            self.pending_event.lock().await.remove(&event_id);
+            self.pending_event.remove(&event_id);
             return Err(ClientError::Disconnected);
         }
 
         match timeout(self.default_timeout, rx).await {
             Ok(result) => result.map_err(|_| ClientError::Disconnected)?,
             Err(_) => {
-                self.pending_event.lock().await.remove(&event_id);
+                self.pending_event.remove(&event_id);
                 Err(ClientError::Timeout)
             }
         }
@@ -243,7 +289,7 @@ impl WscallClient {
     pub async fn close(&self) -> Result<(), ClientError> {
         self.shutdown.store(true, Ordering::SeqCst);
 
-        if let Some(writer) = self.writer.read().await.clone() {
+        if let Some(writer) = self.writer.load_full() {
             let _ = writer.send(ClientOutbound::Close).await;
         }
 
@@ -267,7 +313,7 @@ impl WscallClient {
                 error,
                 ..
             } => {
-                if let Some(tx) = self.pending_api.lock().await.remove(&request_id) {
+                if let Some((_, tx)) = self.pending_api.remove(&request_id) {
                     let result = if ok {
                         Ok(data)
                     } else {
@@ -287,7 +333,7 @@ impl WscallClient {
                 receipt,
                 error,
             } => {
-                if let Some(tx) = self.pending_event.lock().await.remove(&event_id) {
+                if let Some((_, tx)) = self.pending_event.remove(&event_id) {
                     let result = if ok {
                         Ok(receipt)
                     } else {
@@ -308,13 +354,15 @@ impl WscallClient {
                 attachments,
                 metadata,
                 expect_ack,
+                storage_id,
             } => {
                 let event = EventMessage {
-                    event_id: event_id.clone(),
+                    event_id,
                     name: name.clone(),
                     data,
                     attachments,
                     metadata,
+                    storage_id,
                 };
                 let handlers = self
                     .event_handlers
@@ -324,10 +372,20 @@ impl WscallClient {
                     .cloned()
                     .unwrap_or_default();
 
-                let mut receipt = json!({ "handled": false });
-                for handler in handlers {
-                    receipt = handler(event.clone()).await;
-                }
+                // Run all registered handlers concurrently so a single slow
+                // handler no longer blocks the reader loop and subsequent
+                // inbound messages. The last non-default receipt wins,
+                // matching the previous serial semantics.
+                let receipt = if handlers.is_empty() {
+                    json!({ "handled": false })
+                } else {
+                    let futures = handlers.iter().map(|handler| handler(event.clone()));
+                    let results = join_all(futures).await;
+                    results
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| json!({ "handled": false }))
+                };
 
                 if expect_ack {
                     let _ = self
@@ -347,10 +405,7 @@ impl WscallClient {
         }
     }
 
-    async fn run_connection_supervisor(
-        self,
-        ready_tx: oneshot::Sender<Result<(), ClientError>>,
-    ) {
+    async fn run_connection_supervisor(self, ready_tx: oneshot::Sender<Result<(), ClientError>>) {
         let mut ready_tx = Some(ready_tx);
         let mut reconnect_attempt = 0_u32;
 
@@ -380,8 +435,16 @@ impl WscallClient {
                 return;
             }
 
+            // If auto_reconnect is disabled, the supervisor exits after the
+            // first disconnect instead of retrying.
+            if !self.auto_reconnect {
+                return;
+            }
+
             reconnect_attempt = reconnect_attempt.saturating_add(1);
-            sleep(Self::reconnect_delay(reconnect_attempt)).await;
+            // Exponential backoff plus a random sub-second jitter to avoid
+            // synchronized reconnect storms when many clients recover together.
+            sleep(Self::reconnect_delay(reconnect_attempt) + Self::reconnect_jitter()).await;
         }
     }
 
@@ -395,7 +458,7 @@ impl WscallClient {
         let (disconnect_tx, disconnect_rx) = oneshot::channel();
         let disconnect_signal = Arc::new(Mutex::new(Some(disconnect_tx)));
 
-        *self.writer.write().await = Some(tx.clone());
+        self.writer.store(Some(Arc::new(tx.clone())));
         self.is_connected.store(true, Ordering::SeqCst);
         self.emit_connected().await;
 
@@ -413,7 +476,7 @@ impl WscallClient {
                         let encoded = match writer_codec.encode(&packet) {
                             Ok(encoded) => encoded,
                             Err(error) => {
-                                eprintln!("failed to encode outbound frame: {error}");
+                                tracing::warn!(%error, "failed to encode outbound frame");
                                 continue;
                             }
                         };
@@ -483,7 +546,7 @@ impl WscallClient {
                 let message = match next_message {
                     Ok(Some(message)) => message,
                     Ok(None) => {
-                        break ClientError::ConnectionClosed("reader loop stopped".to_string())
+                        break ClientError::ConnectionClosed("reader loop stopped".to_string());
                     }
                     Err(_) => break ClientError::IdleTimeout,
                 };
@@ -491,10 +554,12 @@ impl WscallClient {
                 match message {
                     Ok(Message::Binary(bytes)) => match reader_codec.decode(&bytes) {
                         Ok(packet) => reader_client.handle_packet(packet).await,
-                        Err(error) => eprintln!("failed to decode inbound frame: {error}"),
+                        Err(error) => tracing::warn!(%error, "failed to decode inbound frame"),
                     },
                     Ok(Message::Close(_)) => {
-                        break ClientError::ConnectionClosed("server closed connection".to_string())
+                        break ClientError::ConnectionClosed(
+                            "server closed connection".to_string(),
+                        );
                     }
                     Ok(Message::Ping(payload)) => {
                         if reader_tx
@@ -509,7 +574,7 @@ impl WscallClient {
                     }
                     Ok(Message::Pong(_)) | Ok(Message::Text(_)) | Ok(Message::Frame(_)) => {}
                     Err(error) => {
-                        eprintln!("client reader stopped: {error}");
+                        tracing::warn!(%error, "client reader stopped");
                         break ClientError::ConnectionClosed(error.to_string());
                     }
                 }
@@ -524,11 +589,14 @@ impl WscallClient {
     }
 
     async fn send_outbound(&self, outbound: ClientOutbound) -> Result<(), ClientError> {
-        let Some(writer) = self.writer.read().await.clone() else {
+        let Some(writer) = self.writer.load_full() else {
             return Err(ClientError::Disconnected);
         };
 
-        writer.send(outbound).await.map_err(|_| ClientError::Disconnected)
+        writer
+            .send(outbound)
+            .await
+            .map_err(|_| ClientError::Disconnected)
     }
 
     async fn handle_disconnect(
@@ -547,23 +615,30 @@ impl WscallClient {
             return;
         }
 
-        *self.writer.write().await = None;
+        self.writer.store(None);
 
-        let pending_api = std::mem::take(&mut *self.pending_api.lock().await);
-        for sender in pending_api.into_values() {
-            let _ = sender.send(Err(ClientError::ConnectionClosed(reason.clone())));
+        // Drain the lock-free pending maps and notify each waiter. Keys are
+        // collected first so we never hold a DashMap shard guard across an
+        // await or a mutation.
+        let api_keys: Vec<u64> = self.pending_api.iter().map(|kv| *kv.key()).collect();
+        for key in api_keys {
+            if let Some((_, sender)) = self.pending_api.remove(&key) {
+                let _ = sender.send(Err(ClientError::ConnectionClosed(reason.clone())));
+            }
         }
 
-        let pending_event = std::mem::take(&mut *self.pending_event.lock().await);
-        for sender in pending_event.into_values() {
-            let _ = sender.send(Err(ClientError::ConnectionClosed(reason.clone())));
+        let event_keys: Vec<u64> = self.pending_event.iter().map(|kv| *kv.key()).collect();
+        for key in event_keys {
+            if let Some((_, sender)) = self.pending_event.remove(&key) {
+                let _ = sender.send(Err(ClientError::ConnectionClosed(reason.clone())));
+            }
         }
 
         self.emit_disconnected(ClientDisconnectEvent {
             url: self.url.to_string(),
             reason,
-            will_reconnect: !self.shutdown.load(Ordering::SeqCst),
-            retry_after: (!self.shutdown.load(Ordering::SeqCst))
+            will_reconnect: !self.shutdown.load(Ordering::SeqCst) && self.auto_reconnect,
+            retry_after: (!self.shutdown.load(Ordering::SeqCst) && self.auto_reconnect)
                 .then_some(Self::reconnect_delay(1)),
         })
         .await;
@@ -586,11 +661,27 @@ impl WscallClient {
         self.connection_generation.load(Ordering::SeqCst) == generation
     }
 
+    /// Deterministic exponential backoff (without jitter) used for the reported
+    /// `retry_after`. The supervisor adds jitter on top of this value so the
+    /// displayed estimate stays stable while the actual sleep is randomized.
     fn reconnect_delay(attempt: u32) -> Duration {
+        let attempt = attempt.max(1);
+        let exponent = (attempt - 1).min(6);
         let seconds = CLIENT_RECONNECT_BASE_DELAY_SECS
-            .saturating_add(u64::from(attempt.saturating_sub(1)))
+            .saturating_mul(1u64 << exponent)
             .min(CLIENT_RECONNECT_MAX_DELAY_SECS);
         Duration::from_secs(seconds)
+    }
+
+    /// Random sub-second jitter in `[0, base/2)` to de-synchronize reconnecting
+    /// clients and avoid thundering-herd spikes against a recovering server.
+    fn reconnect_jitter() -> Duration {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.subsec_nanos() as u64)
+            .unwrap_or(0);
+        let max_nanos = (CLIENT_RECONNECT_BASE_DELAY_SECS * 1_000_000_000) / 2;
+        Duration::from_nanos(nanos % max_nanos.max(1))
     }
 
     async fn emit_connected(&self) {
@@ -615,8 +706,12 @@ impl WscallClient {
         handler: ConnectionHandler,
         event: ClientConnectionEvent,
     ) {
-        if AssertUnwindSafe(handler(event)).catch_unwind().await.is_err() {
-            eprintln!("client connected handler panicked");
+        if AssertUnwindSafe(handler(event))
+            .catch_unwind()
+            .await
+            .is_err()
+        {
+            tracing::error!("client connected handler panicked");
         }
     }
 
@@ -625,8 +720,12 @@ impl WscallClient {
         handler: DisconnectHandler,
         event: ClientDisconnectEvent,
     ) {
-        if AssertUnwindSafe(handler(event)).catch_unwind().await.is_err() {
-            eprintln!("client disconnected handler panicked");
+        if AssertUnwindSafe(handler(event))
+            .catch_unwind()
+            .await
+            .is_err()
+        {
+            tracing::error!("client disconnected handler panicked");
         }
     }
 }

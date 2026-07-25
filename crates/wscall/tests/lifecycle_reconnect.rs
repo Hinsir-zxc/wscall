@@ -102,7 +102,8 @@ async fn lifecycle_callbacks_fire_for_client_and_server() {
     server.on_disconnected(move |ctx| {
         let server_disc_tx = server_disc_tx.clone();
         async move {
-            let _ = server_disc_tx.send((ctx.connection_id().to_string(), ctx.reason().to_string()));
+            let _ =
+                server_disc_tx.send((ctx.connection_id().to_string(), ctx.reason().to_string()));
         }
     });
     server.route("system.echo", |ctx| async move {
@@ -115,7 +116,9 @@ async fn lifecycle_callbacks_fire_for_client_and_server() {
     let server_task = tokio::spawn(async move { server.listen(&address).await });
     sleep(Duration::from_millis(100)).await;
 
-    let client = WscallClient::connect(&url).await.expect("client should connect");
+    let client = WscallClient::connect(&url)
+        .await
+        .expect("client should connect");
     let (client_conn_tx, mut client_conn_rx) = mpsc::unbounded_channel();
     let (client_disc_tx, mut client_disc_rx) = mpsc::unbounded_channel();
 
@@ -131,7 +134,8 @@ async fn lifecycle_callbacks_fire_for_client_and_server() {
         .on_disconnected(move |event| {
             let client_disc_tx = client_disc_tx.clone();
             async move {
-                let _ = client_disc_tx.send((event.reason, event.will_reconnect, event.retry_after));
+                let _ =
+                    client_disc_tx.send((event.reason, event.will_reconnect, event.retry_after));
             }
         })
         .await;
@@ -169,7 +173,9 @@ async fn client_reconnects_after_unexpected_disconnect() {
     let first_server = tokio::spawn(run_test_protocol_server(address.clone(), "first", true));
     sleep(Duration::from_millis(100)).await;
 
-    let client = WscallClient::connect(&url).await.expect("client should connect");
+    let client = WscallClient::connect(&url)
+        .await
+        .expect("client should connect");
     let (connected_tx, mut connected_rx) = mpsc::unbounded_channel();
     let (disconnected_tx, mut disconnected_rx) = mpsc::unbounded_channel();
 
@@ -185,7 +191,8 @@ async fn client_reconnects_after_unexpected_disconnect() {
         .on_disconnected(move |event| {
             let disconnected_tx = disconnected_tx.clone();
             async move {
-                let _ = disconnected_tx.send((event.reason, event.will_reconnect, event.retry_after));
+                let _ =
+                    disconnected_tx.send((event.reason, event.will_reconnect, event.retry_after));
             }
         })
         .await;

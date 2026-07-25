@@ -54,6 +54,10 @@ struct RegisterUserParams {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
     let history = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
     let mut server = WscallServer::new().with_chacha20_key(DEMO_CHACHA20_KEY);
 

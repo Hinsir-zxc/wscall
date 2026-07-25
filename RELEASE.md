@@ -7,7 +7,7 @@ This workspace publishes a crate family with dependency ordering:
 3. `wscall-client`
 4. `wscall`
 
-Current target release: `0.1.1`
+Current target release: `0.2.0`
 
 ## Pre-release checks
 
@@ -70,7 +70,7 @@ cargo publish -p wscall
 Run through this list before the first `cargo publish`:
 
 1. Working tree is clean or intentionally dirty for a local dry run.
-2. Workspace version is set to `0.1.1` and internal crate dependency pins also use `0.1.1`.
+2. Workspace version is set to `0.2.0` and internal crate dependency pins also use `0.2.0`.
 3. `CHANGELOG.md` includes the target version notes.
 4. `README.md` quick-start commands still work.
 5. Workspace quality gates pass.

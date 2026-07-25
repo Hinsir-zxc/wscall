@@ -34,8 +34,8 @@ pub struct ClientDisconnectEvent {
 /// Server-originated event delivered to a registered client event handler.
 #[derive(Clone)]
 pub struct EventMessage {
-    /// Event correlation id.
-    pub event_id: String,
+    /// Event correlation id (per-connection u64 counter).
+    pub event_id: u64,
     /// Event name.
     pub name: String,
     /// Raw JSON event data.
@@ -44,6 +44,8 @@ pub struct EventMessage {
     pub attachments: Vec<FileAttachment>,
     /// Raw metadata payload.
     pub metadata: Value,
+    /// Storage ID from a database or other persistent store, when present.
+    pub storage_id: Option<u64>,
 }
 
 /// Errors produced by the reusable WSCALL client.
