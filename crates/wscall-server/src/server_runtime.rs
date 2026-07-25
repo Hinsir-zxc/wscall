@@ -12,15 +12,16 @@ use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{MissedTickBehavior, interval, timeout};
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 use uuid::Uuid;
 use validator::Validate;
 use wscall_protocol::{
-    EncryptionKind, ErrorPayload, FileAttachment, FrameCodec, PacketBody, PacketEnvelope,
+    EcdhKeypair, EncryptionKind, ErrorPayload, FileAttachment, FrameCodec, PacketBody,
+    PacketEnvelope, ProtocolError, parse_peer_public,
 };
 
 use crate::server_types::{
-    ApiContext, ApiError, EventContext, ExceptionContext, ServerConnectionContext,
+    ApiContext, ApiError, ClientEntry, EventContext, ExceptionContext, ServerConnectionContext,
     ServerDisconnectContext, ServerError, ServerHandle, ServerOutbound, ServerState,
 };
 
@@ -113,19 +114,40 @@ impl ServerHandle {
             self.default_encryption,
         );
 
-        let encoded = self
-            .codec
-            .encode(&packet)
-            .map_err(|_| ApiError::internal("failed to encode broadcast event"))?;
-        let encoded = Bytes::from(encoded);
+        if self.is_ecdh {
+            // ECDH mode: each connection has a unique session key, so the
+            // writer task must encode per-connection.
+            for entry in self.state.clients.iter() {
+                if entry
+                    .value()
+                    .sender
+                    .try_send(ServerOutbound::Packet(packet.clone()))
+                    .is_err()
+                {
+                    tracing::warn!(
+                        "broadcast: outbound queue full, dropping event for a connection"
+                    );
+                }
+            }
+        } else {
+            // PSK mode: all connections share the same key, so encode once.
+            let encoded = self
+                .codec
+                .encode(&packet)
+                .map_err(|_| ApiError::internal("failed to encode broadcast event"))?;
+            let encoded = Bytes::from(encoded);
 
-        for entry in self.state.clients.iter() {
-            if entry
-                .value()
-                .try_send(ServerOutbound::PreEncoded(encoded.clone()))
-                .is_err()
-            {
-                tracing::warn!("broadcast: outbound queue full, dropping event for a connection");
+            for entry in self.state.clients.iter() {
+                if entry
+                    .value()
+                    .sender
+                    .try_send(ServerOutbound::PreEncoded(encoded.clone()))
+                    .is_err()
+                {
+                    tracing::warn!(
+                        "broadcast: outbound queue full, dropping event for a connection"
+                    );
+                }
             }
         }
         Ok(())
@@ -181,20 +203,29 @@ impl ServerHandle {
             self.default_encryption,
         );
 
-        let encoded = self
-            .codec
-            .encode(&packet)
-            .map_err(|_| ApiError::internal("failed to encode direct event"))?;
-        let encoded = Bytes::from(encoded);
-
         let entry = self
             .state
             .clients
             .get(connection_id)
             .ok_or_else(|| ApiError::not_found("target connection not found"))?;
-        entry
-            .try_send(ServerOutbound::PreEncoded(encoded))
-            .map_err(|_| ApiError::internal("failed to queue direct event"))
+
+        if self.is_ecdh {
+            // ECDH mode: send unencoded packet; the writer encodes it.
+            entry
+                .sender
+                .try_send(ServerOutbound::Packet(packet))
+                .map_err(|_| ApiError::internal("failed to queue direct event"))
+        } else {
+            let encoded = self
+                .codec
+                .encode(&packet)
+                .map_err(|_| ApiError::internal("failed to encode direct event"))?;
+            let encoded = Bytes::from(encoded);
+            entry
+                .sender
+                .try_send(ServerOutbound::PreEncoded(encoded))
+                .map_err(|_| ApiError::internal("failed to queue direct event"))
+        }
     }
 
     /// Returns the current number of live connections.
@@ -213,6 +244,8 @@ pub struct WscallServer {
     exception_handler: Option<ExceptionHandler>,
     codec: FrameCodec,
     default_encryption: EncryptionKind,
+    /// Whether ECDH dynamic key agreement is enabled (no pre-shared key).
+    is_ecdh: bool,
     /// Optional global cap on concurrent accepted connections.
     max_connections: Option<usize>,
     /// Per-connection cap on concurrently running request/event handlers.
@@ -237,9 +270,25 @@ impl WscallServer {
             exception_handler: None,
             codec: FrameCodec::plaintext(),
             default_encryption: EncryptionKind::None,
+            is_ecdh: false,
             max_connections: None,
             max_in_flight: SERVER_DEFAULT_MAX_IN_FLIGHT,
         }
+    }
+
+    /// Enables ECDH dynamic key agreement.
+    ///
+    /// Instead of a pre-shared symmetric key, each connection performs an
+    /// X25519 handshake right after the WebSocket upgrade. The negotiated
+    /// 32-byte session key is used with ChaCha20-Poly1305 for all subsequent
+    /// frames. This is mutually exclusive with `with_chacha20_key` /
+    /// `with_aes256_key`.
+    pub fn with_ecdh(mut self) -> Self {
+        self.is_ecdh = true;
+        // The global codec stays plaintext; per-connection codecs carry the
+        // negotiated session keys.
+        self.default_encryption = EncryptionKind::ChaCha20;
+        self
     }
 
     pub fn with_chacha20_key(mut self, key: [u8; 32]) -> Self {
@@ -276,6 +325,7 @@ impl WscallServer {
             state: Arc::clone(&self.state),
             codec: self.codec.clone(),
             default_encryption: self.default_encryption,
+            is_ecdh: self.is_ecdh,
         }
     }
 
@@ -418,16 +468,42 @@ impl WscallServer {
         stream: TcpStream,
         peer: std::net::SocketAddr,
     ) -> Result<(), ServerError> {
-        let websocket = accept_async(stream).await?;
+        let mut websocket = accept_async(stream).await?;
         let connection_id = Uuid::now_v7().to_string();
-        let (mut sink, mut stream) = websocket.split();
-        let (tx, mut rx) = mpsc::channel::<ServerOutbound>(SERVER_OUTBOUND_QUEUE_CAPACITY);
         let peer_addr = Some(peer);
 
-        self.state.clients.insert(connection_id.clone(), tx.clone());
+        // ECDH handshake: exchange X25519 public keys and derive a per-
+        // connection session key before splitting the stream.
+        let (session_codec, session_encryption) = if self.is_ecdh {
+            self.perform_ecdh_handshake(&mut websocket).await?
+        } else {
+            (self.codec.clone(), self.default_encryption)
+        };
+
+        let (mut sink, mut stream) = websocket.split();
+        let (tx, mut rx) = mpsc::channel::<ServerOutbound>(SERVER_OUTBOUND_QUEUE_CAPACITY);
+
+        // Store the per-connection entry. In ECDH mode each entry carries its
+        // own codec; in PSK mode the entry falls back to the global codec.
+        let entry_codec = if self.is_ecdh {
+            Some(session_codec.clone())
+        } else {
+            None
+        };
+        self.state.clients.insert(
+            connection_id.clone(),
+            ClientEntry {
+                sender: tx.clone(),
+                codec: entry_codec,
+                encryption: session_encryption,
+            },
+        );
 
         self.notify_connected(&connection_id, peer_addr).await;
 
+        // The writer needs the per-connection codec to encode `Packet`
+        // variants (ECDH mode).
+        let writer_codec = session_codec.clone();
         let mut writer = tokio::spawn(async move {
             let mut ticker = interval(SERVER_HEARTBEAT_INTERVAL);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -440,6 +516,10 @@ impl WscallServer {
                         match outbound {
                             ServerOutbound::PreEncoded(bytes) => {
                                 sink.send(Message::Binary(bytes.to_vec())).await?;
+                            }
+                            ServerOutbound::Packet(packet) => {
+                                let encoded = writer_codec.encode(&packet)?;
+                                sink.send(Message::Binary(encoded)).await?;
                             }
                             ServerOutbound::Pong(payload) => {
                                 sink.send(Message::Pong(payload)).await?;
@@ -458,6 +538,10 @@ impl WscallServer {
                 }
             }
         });
+
+        // The reader uses the per-connection codec (session key in ECDH mode,
+        // global codec in PSK mode).
+        let reader_codec = session_codec.clone();
 
         // Per-connection concurrency limit for handler execution. The reader
         // stays non-blocking under normal load; under overload it pauses reading
@@ -485,7 +569,7 @@ impl WscallServer {
 
                 match message? {
                     Message::Binary(bytes) => {
-                        let packet = self.codec.decode(&bytes)?;
+                        let packet = reader_codec.decode(&bytes)?;
 
                         let spawn_handler = matches!(
                             &packet.body,
@@ -541,6 +625,59 @@ impl WscallServer {
         self.notify_disconnected(&connection_id, peer_addr, Self::disconnect_reason(&result))
             .await;
         result
+    }
+
+    /// Performs the X25519 ECDH handshake over the combined WebSocket stream.
+    ///
+    /// 1. Generate a server keypair.
+    /// 2. Wait for the client's 32-byte public key (raw binary message).
+    /// 3. Send the server's 32-byte public key back.
+    /// 4. Derive the 32-byte ChaCha20-Poly1305 session key.
+    ///
+    /// Must be called before `websocket.split()` because it uses both
+    /// the read and write halves of the stream.
+    async fn perform_ecdh_handshake(
+        &self,
+        websocket: &mut WebSocketStream<TcpStream>,
+    ) -> Result<(FrameCodec, EncryptionKind), ServerError> {
+        // 1. Generate server keypair.
+        let keypair = EcdhKeypair::generate()?;
+
+        // 2. Read the client's public key (first binary WebSocket message).
+        let client_public = loop {
+            let next = timeout(Duration::from_secs(10), websocket.next()).await;
+            match next {
+                Ok(Some(Ok(Message::Binary(bytes)))) => {
+                    match parse_peer_public(&bytes) {
+                        Ok(key) => break key,
+                        Err(_) => {
+                            return Err(ProtocolError::EcdhHandshake(
+                                "client sent invalid public key length".to_string(),
+                            )
+                            .into());
+                        }
+                    }
+                }
+                _ => {
+                    return Err(ProtocolError::EcdhHandshake(
+                        "client did not send a valid public key".to_string(),
+                    )
+                    .into());
+                }
+            }
+        };
+
+        // 3. Send the server's public key.
+        websocket
+            .send(Message::Binary(keypair.public_bytes().to_vec()))
+            .await?;
+
+        // 4. Derive the session key and build the per-connection codec.
+        let session_key = keypair.derive_session_key(&client_public);
+        Ok((
+            FrameCodec::plaintext().with_chacha20_key(session_key),
+            EncryptionKind::ChaCha20,
+        ))
     }
 
     async fn process_packet(
@@ -627,13 +764,10 @@ impl WscallServer {
         connection_id: &str,
         packet: PacketEnvelope,
     ) -> Result<(), ServerError> {
-        let encoded = self.codec.encode(&packet)?;
-        let encoded = Bytes::from(encoded);
-
         // Clone the sender out of the DashMap guard before awaiting so the
         // shard lock is never held across an await point.
         let sender = match self.state.clients.get(connection_id) {
-            Some(entry) => entry.clone(),
+            Some(entry) => entry.sender.clone(),
             None => {
                 return Err(ServerError::Api(ApiError::not_found(
                     "connection is closed",
@@ -641,10 +775,25 @@ impl WscallServer {
             }
         };
 
-        sender
-            .send(ServerOutbound::PreEncoded(encoded))
-            .await
-            .map_err(|_| ServerError::Api(ApiError::internal("failed to queue outbound packet")))
+        if self.is_ecdh {
+            // ECDH mode: the writer task encodes with the per-connection codec.
+            sender
+                .send(ServerOutbound::Packet(packet))
+                .await
+                .map_err(|_| {
+                    ServerError::Api(ApiError::internal("failed to queue outbound packet"))
+                })
+        } else {
+            // PSK mode: pre-encode with the shared global codec.
+            let encoded = self.codec.encode(&packet)?;
+            let encoded = Bytes::from(encoded);
+            sender
+                .send(ServerOutbound::PreEncoded(encoded))
+                .await
+                .map_err(|_| {
+                    ServerError::Api(ApiError::internal("failed to queue outbound packet"))
+                })
+        }
     }
 
     async fn run_api_request(

@@ -59,7 +59,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .try_init();
 
     let history = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
-    let mut server = WscallServer::new().with_chacha20_key(DEMO_CHACHA20_KEY);
+    // --ecdh: use ECDH dynamic key agreement (no pre-shared key needed).
+    let use_ecdh = std::env::args().any(|a| a == "--ecdh");
+    let mut server = if use_ecdh {
+        println!("starting server in ECDH mode (dynamic key agreement)");
+        WscallServer::new().with_ecdh()
+    } else {
+        println!("starting server in PSK mode (ChaCha20)");
+        WscallServer::new().with_chacha20_key(DEMO_CHACHA20_KEY)
+    };
 
     server.on_connected(|ctx| async move {
         println!(

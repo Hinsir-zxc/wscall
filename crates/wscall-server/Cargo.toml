@@ -29,3 +29,5 @@ tracing.workspace = true
 uuid.workspace = true
 validator.workspace = true
 wscall-protocol = { path = "../wscall-protocol", version = "0.2.0" }
+x25519-dalek.workspace = true
+sha2.workspace = true

@@ -15,7 +15,8 @@ use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use wscall_protocol::{
-    EncryptionKind, ErrorPayload, FileAttachment, FrameCodec, PacketBody, PacketEnvelope,
+    EcdhKeypair, EncryptionKind, ErrorPayload, FileAttachment, FrameCodec, PacketBody,
+    PacketEnvelope, parse_peer_public,
 };
 
 use crate::client_types::{
@@ -60,6 +61,8 @@ pub struct WscallClient {
     is_connected: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     connection_generation: Arc<AtomicU64>,
+    /// Whether the client uses ECDH dynamic key agreement.
+    use_ecdh: bool,
     /// Per-connection request id counter (starts at 1).
     next_request_id: Arc<AtomicU64>,
     /// Per-connection event id counter (starts at 1).
@@ -68,7 +71,7 @@ pub struct WscallClient {
 
 impl WscallClient {
     pub async fn connect(url: &str) -> Result<Self, ClientError> {
-        Self::connect_with_settings(url, FrameCodec::plaintext(), EncryptionKind::None, true).await
+        Self::connect_with_settings(url, FrameCodec::plaintext(), EncryptionKind::None, true, false).await
     }
 
     /// Connect with explicit control over auto-reconnect behavior.
@@ -86,6 +89,7 @@ impl WscallClient {
             FrameCodec::plaintext(),
             EncryptionKind::None,
             auto_reconnect,
+            false,
         )
         .await
     }
@@ -96,6 +100,7 @@ impl WscallClient {
             FrameCodec::plaintext().with_chacha20_key(key),
             EncryptionKind::ChaCha20,
             true,
+            false,
         )
         .await
     }
@@ -106,6 +111,25 @@ impl WscallClient {
             FrameCodec::plaintext().with_aes256_key(key),
             EncryptionKind::Aes256,
             true,
+            false,
+        )
+        .await
+    }
+
+    /// Connect using ECDH dynamic key agreement.
+    ///
+    /// No pre-shared key is required. The client and server perform an X25519
+    /// handshake immediately after the WebSocket upgrade and derive a unique
+    /// 32-byte ChaCha20-Poly1305 session key. All subsequent frames are
+    /// encrypted with this key, which is unique per connection and never
+    /// transmitted over the wire.
+    pub async fn connect_with_ecdh(url: &str) -> Result<Self, ClientError> {
+        Self::connect_with_settings(
+            url,
+            FrameCodec::plaintext(),
+            EncryptionKind::ChaCha20,
+            true,
+            true,
         )
         .await
     }
@@ -115,6 +139,7 @@ impl WscallClient {
         codec: FrameCodec,
         default_encryption: EncryptionKind,
         auto_reconnect: bool,
+        use_ecdh: bool,
     ) -> Result<Self, ClientError> {
         let client = Self {
             url: Arc::<str>::from(url),
@@ -131,6 +156,7 @@ impl WscallClient {
             is_connected: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(AtomicBool::new(false)),
             connection_generation: Arc::new(AtomicU64::new(0)),
+            use_ecdh,
             next_request_id: Arc::new(AtomicU64::new(0)),
             next_event_id: Arc::new(AtomicU64::new(0)),
         };
@@ -452,7 +478,39 @@ impl WscallClient {
         &self,
         generation: u64,
     ) -> Result<oneshot::Receiver<ClientError>, ClientError> {
-        let (socket, _) = connect_async(self.url.as_ref()).await?;
+        let (mut socket, _) = connect_async(self.url.as_ref()).await?;
+
+        // ECDH handshake: exchange X25519 public keys before splitting the
+        // stream. The derived session key replaces the global codec for both
+        // the writer and the reader.
+        let session_codec = if self.use_ecdh {
+            let keypair = EcdhKeypair::generate()?;
+
+            // Send the client's 32-byte public key as a raw binary message.
+            socket
+                .send(Message::Binary(keypair.public_bytes().to_vec()))
+                .await
+                .map_err(|e| ClientError::ConnectionClosed(e.to_string()))?;
+
+            // Read the server's 32-byte public key.
+            let server_public = loop {
+                let next = timeout(Duration::from_secs(10), socket.next()).await;
+                match next {
+                    Ok(Some(Ok(Message::Binary(bytes)))) => break parse_peer_public(&bytes)?,
+                    _ => {
+                        return Err(ClientError::ConnectionClosed(
+                            "ECDH handshake failed: no valid server public key".to_string(),
+                        ))
+                    }
+                }
+            };
+
+            let session_key = keypair.derive_session_key(&server_public);
+            FrameCodec::plaintext().with_chacha20_key(session_key)
+        } else {
+            self.codec.clone()
+        };
+
         let (mut sink, mut stream) = socket.split();
         let (tx, mut rx) = mpsc::channel::<ClientOutbound>(CLIENT_OUTBOUND_QUEUE_CAPACITY);
         let (disconnect_tx, disconnect_rx) = oneshot::channel();
@@ -462,7 +520,7 @@ impl WscallClient {
         self.is_connected.store(true, Ordering::SeqCst);
         self.emit_connected().await;
 
-        let writer_codec = self.codec.clone();
+        let writer_codec = session_codec.clone();
         let writer_client = self.clone();
         let writer_signal = Arc::clone(&disconnect_signal);
         tokio::spawn(async move {
@@ -538,7 +596,7 @@ impl WscallClient {
 
         let reader_client = self.clone();
         let reader_tx = tx;
-        let reader_codec = self.codec.clone();
+        let reader_codec = session_codec.clone();
         let reader_signal = Arc::clone(&disconnect_signal);
         tokio::spawn(async move {
             let error = loop {

@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use validator::Validate;
-use wscall_protocol::{EncryptionKind, ErrorPayload, FileAttachment, FrameCodec, ProtocolError};
+use wscall_protocol::{EncryptionKind, ErrorPayload, FileAttachment, FrameCodec, PacketEnvelope, ProtocolError};
 
 use crate::validation;
 
@@ -19,13 +19,34 @@ pub(crate) enum ServerOutbound {
     /// writer task only ships bytes, which keeps the writer cheap and shared
     /// across recipients for broadcasts.
     PreEncoded(Bytes),
+    /// An unencoded packet that the writer must encode using the per-connection
+    /// codec (used in ECDH mode where each connection has a unique session key).
+    Packet(PacketEnvelope),
     Pong(Vec<u8>),
     Close,
 }
 
+/// Per-connection entry stored in the live client table.
+///
+/// In PSK mode `codec` is a clone of the server-wide codec (all connections
+/// share the same key). In ECDH mode each entry carries a unique codec built
+/// from the session key negotiated during the handshake.
+pub(crate) struct ClientEntry {
+    pub sender: mpsc::Sender<ServerOutbound>,
+    /// Per-connection codec. `None` means "use the global codec".
+    pub codec: Option<FrameCodec>,
+    pub encryption: EncryptionKind,
+}
+
+impl ClientEntry {
+    /// Resolves the effective codec, falling back to the global one.
+    pub fn effective_codec(&self, global: &FrameCodec) -> FrameCodec {        self.codec.clone().unwrap_or_else(|| global.clone())
+    }
+}
+
 /// Shared, lock-free table of live client outbound channels.
 pub(crate) struct ServerState {
-    pub clients: DashMap<String, mpsc::Sender<ServerOutbound>>,
+    pub clients: DashMap<String, ClientEntry>,
     /// Per-server event id counter for server-originated events.
     pub next_event_id: AtomicU64,
 }
@@ -54,6 +75,8 @@ pub struct ServerHandle {
     pub(crate) state: Arc<ServerState>,
     pub(crate) codec: FrameCodec,
     pub(crate) default_encryption: EncryptionKind,
+    /// Whether the server is in ECDH mode (per-connection session keys).
+    pub(crate) is_ecdh: bool,
 }
 
 /// Context passed to server connection lifecycle handlers.

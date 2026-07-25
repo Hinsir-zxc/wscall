@@ -9,9 +9,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    let client =
+    // --ecdh: use ECDH dynamic key agreement (no pre-shared key needed).
+    let use_ecdh = std::env::args().any(|a| a == "--ecdh");
+    let client = if use_ecdh {
+        println!("connecting in ECDH mode (dynamic key agreement)");
+        WscallClient::connect_with_ecdh("ws://127.0.0.1:9001/socket").await?
+    } else {
+        println!("connecting in PSK mode (ChaCha20)");
         WscallClient::connect_with_chacha20("ws://127.0.0.1:9001/socket", DEMO_CHACHA20_KEY)
-            .await?;
+            .await?
+    };
 
     client
         .on_connected(|event| async move {

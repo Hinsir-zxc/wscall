@@ -1,6 +1,6 @@
 # wscall
 
-WSCALL is a lightweight WebSocket API framework with a custom binary frame protocol, a reusable Rust server crate, a reusable Rust client crate, and a facade crate for consumers that prefer a single dependency.
+WSCALL is a lightweight WebSocket API framework with a custom binary frame protocol, a reusable Rust server crate, a reusable Rust client crate, a JavaScript client SDK, and a facade crate for consumers that prefer a single dependency.
 
 ## Workspace Layout
 
@@ -39,6 +39,20 @@ Transport behavior:
 6. `request_id`/`event_id` are per-connection `u64` counters serialized as JSON numbers (1–6 bytes).
 7. `connection_id` uses UUIDv7 (time-ordered, generated once per connection).
 8. Events may carry an optional `si` (Storage ID) field for server-pushed persisted messages.
+
+### Key Agreement Modes
+
+The framework supports two key modes, determined at connection time:
+
+**PSK (Pre-Shared Key)** — all connections share a single `ChaCha20-Poly1305` or `AES-256-GCM` key configured on both sides. Suitable for trusted environments where keys can be pre-distributed.
+
+**ECDH Dynamic Key Agreement** — based on X25519, each connection negotiates a unique 32-byte `ChaCha20-Poly1305` session key via an in-band handshake immediately after the WebSocket upgrade. The session key is never transmitted over the wire. This mode provides forward secrecy and is suitable for zero-trust deployments.
+
+- Server: `WscallServer::new().with_ecdh()`
+- Rust client: `WscallClient::connect_with_ecdh(url)`
+- JS client: `WscallClient.connectWithEcdh(url)`
+
+The handshake exchanges 32-byte raw public keys as binary WebSocket messages, then derives `SHA-256("wscall-ecdh-v1" || shared_secret)` as the session key.
 
 ## Use As Crates
 
@@ -110,6 +124,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+ECDH client (no pre-shared key needed):
+
+```rust
+let client = WscallClient::connect_with_ecdh("ws://127.0.0.1:9001/socket").await?;
+```
+
 Client reconnect behavior:
 
 1. Unexpected disconnects trigger automatic reconnect attempts (controlled by `auto_reconnect`, default `true`).
@@ -131,13 +151,31 @@ cargo run -p wscall --example quick_start --features full
 Start the demo server:
 
 ```bash
+# PSK (ChaCha20) mode
 cargo run -p wscall --example demo_server --features server
+
+# ECDH mode
+cargo run -p wscall --example demo_server --features server -- --ecdh
 ```
 
 In another terminal, run the demo client:
 
 ```bash
+# PSK (ChaCha20) mode
 cargo run -p wscall --example demo_client --features client
+
+# ECDH mode
+cargo run -p wscall --example demo_client --features client -- --ecdh
+```
+
+A JavaScript demo client is also available in the `wscall-client-js` repository:
+
+```bash
+# PSK mode
+node demo/demo.js
+
+# ECDH mode
+node demo/demo.js --ecdh
 ```
 
 The demos exercise:
@@ -147,6 +185,7 @@ The demos exercise:
 3. `chat.message` event emit and broadcast.
 4. `chat.history` API query.
 5. End-to-end ChaCha20 frame encryption using the demo key wired in both examples.
+6. ECDH mode (`--ecdh` flag) demonstrates dynamic per-connection key agreement without any pre-shared key.
 
 ## Performance Highlights
 
@@ -157,6 +196,7 @@ The demos exercise:
 5. **Cached ciphers**: AES-256-GCM and ChaCha20-Poly1305 key schedules are computed once and shared via `Arc`.
 6. **Compact wire format**: single-letter JSON keys + numeric `k` tag + `u64` counters for IDs minimize per-frame byte overhead.
 7. **Low latency**: `TCP_NODELAY` on accept, `tracing` instead of `println!` on hot paths.
+8. **Forward secrecy via ECDH**: each connection negotiates a unique X25519 session key; reconnects generate fresh keys automatically.
 
 See `framework-instruction.md` for the full architecture and performance model documentation.
 
@@ -190,7 +230,8 @@ Version history is tracked in `CHANGELOG.md`.
 ## Current Constraints
 
 1. `ChaCha20` and `AES256-GCM` are implemented in `FrameCodec`; the demos default to `ChaCha20`.
-2. Attachments are inline Base64 and suited to small files.
-3. Large-file chunking is not part of the current core protocol.
-4. The published crate and code identifiers have been renamed to `wscall`.
-5. Client SDK is Rust-only; a JavaScript client is planned for a future release.
+2. `ECDH` mode uses X25519 via `x25519-dalek` (Rust) and `@noble/curves` (JS); session keys are always `ChaCha20-Poly1305`.
+3. Attachments are inline Base64 and suited to small files.
+4. Large-file chunking is not part of the current core protocol.
+5. The published crate and code identifiers have been renamed to `wscall`.
+6. JavaScript client SDK is available at `wscall-client-js`; it supports PSK and ECDH modes.

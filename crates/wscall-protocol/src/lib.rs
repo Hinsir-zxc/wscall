@@ -15,7 +15,89 @@ use serde::de::Deserializer;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+use x25519_dalek::{PublicKey, StaticSecret};
+
+// ─── ECDH Dynamic Key Agreement ─────────────────────────────────────────────
+//
+// When the ECDH handshake mode is enabled, the client and server exchange
+// raw X25519 public keys (32 bytes each) over the WebSocket binary channel
+// immediately after the TCP/TLS upgrade. Both sides derive the same 32-byte
+// ChaCha20-Poly1305 session key via SHA-256(domain ‖ DH secret). This key is
+// unique per connection and never travels over the wire.
+
+/// Domain-separation tag mixed into the SHA-256 KDF so that wscall session
+/// keys cannot collide with keys derived for any other protocol.
+pub const ECDH_DOMAIN_TAG: &[u8] = b"wscall-ecdh-v1";
+
+/// Byte length of an X25519 public key (also the secret key length).
+pub const ECDH_KEY_LEN: usize = 32;
+
+/// A freshly generated X25519 keypair for the ECDH handshake.
+///
+/// The secret is zeroized on drop. Keep the secret on the side that generated
+/// it and send only the [`EcdhKeypair::public`] bytes to the peer.
+pub struct EcdhKeypair {
+    secret: StaticSecret,
+    public: PublicKey,
+}
+
+impl EcdhKeypair {
+    /// Generates a random X25519 keypair using the platform CSPRNG.
+    pub fn generate() -> Result<Self, ProtocolError> {
+        let mut secret_bytes = [0u8; ECDH_KEY_LEN];
+        getrandom(&mut secret_bytes)
+            .map_err(|source| ProtocolError::Random(source.to_string()))?;
+        let secret = StaticSecret::from(secret_bytes);
+        let public = PublicKey::from(&secret);
+        Ok(Self { secret, public })
+    }
+
+    /// Returns the 32-byte public key that should be sent to the peer.
+    pub fn public_bytes(&self) -> [u8; ECDH_KEY_LEN] {
+        self.public.to_bytes()
+    }
+
+    /// Derives the 32-byte ChaCha20-Poly1305 session key from the peer's
+    /// 32-byte public key.
+    ///
+    /// `peer_public` must be exactly 32 bytes received from the other side.
+    pub fn derive_session_key(&self, peer_public: &[u8; ECDH_KEY_LEN]) -> [u8; 32] {
+        let peer = PublicKey::from(*peer_public);
+        let shared = self.secret.diffie_hellman(&peer);
+        derive_session_key(&shared.to_bytes())
+    }
+}
+
+/// Derives a 32-byte symmetric key from a raw X25519 shared secret.
+///
+/// Uses SHA-256(domain ‖ shared_secret) for domain separation. The result is
+/// suitable as a ChaCha20-Poly1305 or AES-256-GCM key.
+pub fn derive_session_key(shared_secret: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(ECDH_DOMAIN_TAG);
+    hasher.update(shared_secret);
+    let result = hasher.finalize();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&result);
+    key
+}
+
+/// Parses 32 raw bytes received from the peer into an X25519 public key.
+///
+/// Returns an error if the slice is not exactly 32 bytes.
+pub fn parse_peer_public(bytes: &[u8]) -> Result<[u8; ECDH_KEY_LEN], ProtocolError> {
+    if bytes.len() != ECDH_KEY_LEN {
+        return Err(ProtocolError::InvalidEcdhPublicKey {
+            expected: ECDH_KEY_LEN,
+            actual: bytes.len(),
+        });
+    }
+    let mut key = [0u8; ECDH_KEY_LEN];
+    key.copy_from_slice(bytes);
+    Ok(key)
+}
 
 const AES256_NONCE_LEN: usize = 12;
 const CHACHA20_NONCE_LEN: usize = 12;
@@ -705,6 +787,10 @@ pub enum ProtocolError {
     EncryptionFailed(&'static str),
     #[error("decryption failed for {0}")]
     DecryptionFailed(&'static str),
+    #[error("invalid ECDH public key: expected {expected} bytes, got {actual}")]
+    InvalidEcdhPublicKey { expected: usize, actual: usize },
+    #[error("ECDH handshake failed: {0}")]
+    EcdhHandshake(String),
     #[error("message type does not match packet body")]
     MessageTypeMismatch,
     #[error("invalid attachment encoding: {0}")]

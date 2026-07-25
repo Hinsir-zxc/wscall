@@ -1,6 +1,6 @@
 # WSCALL 框架使用说明
 
-> 基于自有二进制协议的轻量级 WebSocket RPC/事件服务框架，提供 Rust 服务端与 Rust 客户端实现。
+> 基于自有二进制协议的轻量级 WebSocket RPC/事件服务框架，提供 Rust 服务端、Rust 客户端与 JavaScript 客户端实现。
 
 ---
 
@@ -16,7 +16,7 @@ WSCALL 在原生 WebSocket 之上承载一套自有的二进制帧协议，将�
 
 当前边界：
 
-- 仅提供 Rust 服务端与 Rust 客户端；JavaScript 客户端为后续规划。
+- 提供 Rust 服务端、Rust 客户端与 JavaScript 客户端 SDK（`wscall-client-js`）。
 - 文件传输走“内联附件 + Base64”，适合轻量文件；大文件分块流式上传未纳入框架核心。
 
 ---
@@ -126,7 +126,30 @@ API 响应：
 
 `PacketBody` 共四种变体：`ApiRequest`(`k=0`) / `EventEmit`(`k=1`) / `ApiResponse`(`k=2`) / `EventAck`(`k=3`)，由数字 `k` 字段区分。`error`(`er`) 字段仅在出错时出现，成功时省略以节省流量。`storage_id`(`si`) 字段仅在事件携带持久化存储ID时出现。
 
-### 3.3 文件参数策略
+### 3.3 加密与密钥协商
+
+框架支持两种密钥模式，在连接建立时确定，后续所有帧统一使用该模式加密：
+
+**PSK（预共享密钥）模式**
+
+- 服务端通过 `with_chacha20_key` / `with_aes256_key` 配置全局共享 codec，所有连接复用同一密钥。
+- 客户端通过 `connect_with_chacha20` / `connect_with_aes256` 传入相同密钥。
+- 适合密钥可安全预分发的内部网络或可信环境。
+
+**ECDH 动态密钥协商模式**
+
+- 基于 X25519 椭圆曲线 Diffie-Hellman，在 WebSocket 升级后、正式 RPC 通信前完成握手。
+- 每个连接独立协商出 32 字节 ChaCha20-Poly1305 会话密钥，密钥从不在线上传输。
+- 会话密钥 = SHA-256(`wscall-ecdh-v1` ‖ shared_secret)，与服务端协议层共用同一 KDF。
+- 握手时序：
+  1. 客户端生成 X25519 keypair，发送 32 字节公钥（原始二进制 WebSocket 消息）。
+  2. 服务端生成自身 keypair，读取客户端公钥后返回 32 字节服务端公钥。
+  3. 双方各自用对方公钥与自身私钥派生相同会话密钥。
+  4. 握手完成，后续所有帧用 ChaCha20-Poly1305 加密。
+- 服务端 ECDH 模式下每连接拥有独立 codec（会话密钥不同），广播与定向推送通过 `ServerOutbound::Packet` 交由 writer task 使用 per-connection codec 编码。
+- Rust 端使用 `x25519-dalek`；JS 端使用 `@noble/curves`。
+
+### 3.4 文件参数策略
 
 JSON 传参与文件混合采用“参数引用 + 附件列表”：
 
@@ -141,11 +164,17 @@ JSON 传参与文件混合采用“参数引用 + 附件列表”：
 ### 4.1 启动与加密
 
 ```rust
+// PSK 模式
 let mut server = WscallServer::new().with_chacha20_key(KEY);
+server.listen("127.0.0.1:9001").await?;
+
+// ECDH 动态密钥协商模式（无需预共享密钥）
+let mut server = WscallServer::new().with_ecdh();
 server.listen("127.0.0.1:9001").await?;
 ```
 
-- `with_chacha20_key([u8;32])` / `with_aes256_key([u8;32])`：配置编解码器并设定默认加密模式。
+- `with_chacha20_key([u8;32])` / `with_aes256_key([u8;32])`：PSK 模式，配置编解码器并设定默认加密模式。
+- `with_ecdh()`：启用 ECDH 动态密钥协商，每连接独立握手派生会话密钥。
 - 明文模式：`WscallServer::new()`。
 
 ### 4.2 路由与参数绑定
@@ -203,14 +232,18 @@ let client = WscallClient::connect(url).await?;
 // 显式控制是否自动重连
 let client = WscallClient::connect_with_auto_reconnect(url, false).await?;
 
-// 加密连接（默认 auto_reconnect = true）
+// PSK 加密连接（默认 auto_reconnect = true）
 WscallClient::connect_with_chacha20(url, KEY).await?;
 WscallClient::connect_with_aes256(url, KEY).await?;
+
+// ECDH 动态密钥协商（无需预共享密钥）
+WscallClient::connect_with_ecdh(url).await?;
 ```
 
 - `connect(url)`：明文连接，`auto_reconnect = true`（默认）。
 - `connect_with_auto_reconnect(url, auto_reconnect)`：明文连接，显式控制重连行为。当 `auto_reconnect = false` 时，断连后不自动重连，由调用方自行管理连接生命周期。
-- `connect_with_chacha20(url, key)` / `connect_with_aes256(url, key)`：加密连接，`auto_reconnect = true`。
+- `connect_with_chacha20(url, key)` / `connect_with_aes256(url, key)`：PSK 加密连接，`auto_reconnect = true`。
+- `connect_with_ecdh(url)`：ECDH 动态密钥协商连接，握手后自动使用 ChaCha20-Poly1305 加密，`auto_reconnect = true`。重连时每条新连接重新握手生成新会话密钥，确保前向安全。
 
 所有 `request_id` / `event_id` 使用 per-connection `AtomicU64` 计数器生成（JSON 数字，1–6 字节）。`connection_id` 保持 UUIDv7（每连接仅生成一次，非热路径）。
 
@@ -304,15 +337,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### 8.2 完整 Demo
 
-- `examples/demo_server.rs`：ChaCha20 加密、过滤器、异常映射、典型/强类型/校验路由、附件、聊天室广播与历史。
+- `examples/demo_server.rs`：ChaCha20 / ECDH 加密、过滤器、异常映射、典型/强类型/校验路由、附件、聊天室广播与历史。
 - `examples/demo_client.rs`：连接、事件监听、API 调用（含附件）、事件发送、历史查询。
 
-运行：
+运行（PSK 模式）：
 
 ```bash
 cargo run --example demo_server --features server
 # 另一终端
 cargo run --example demo_client --features client
+```
+
+运行（ECDH 模式）：
+
+```bash
+cargo run --example demo_server --features server -- --ecdh
+# 另一终端
+cargo run --example demo_client --features client -- --ecdh
 ```
 
 示例入口已安装 `tracing-subscriber`（`RUST_LOG` 控制），可观察库内日志；库本身不依赖任何特定订阅器。
@@ -354,14 +395,14 @@ cargo test --workspace --all-features
 
 ## 11. 关键依赖
 
-`tokio`（异步运行时）、`tokio-tungstenite`（WebSocket）、`serde`/`serde_json`（信封）、`aes-gcm` 与 `chacha20poly1305`（加密）、`uuid`（标识）、`validator`（校验）、`dashmap`（无锁并发表）、`arc-swap`（无锁句柄）、`bytes`（零拷贝广播）、`tracing`（结构化日志）。
+`tokio`（异步运行时）、`tokio-tungstenite`（WebSocket）、`serde`/`serde_json`（信封）、`aes-gcm` 与 `chacha20poly1305`（对称加密）、`x25519-dalek`（ECDH 密钥协商）、`sha2`（会话密钥派生）、`uuid`（标识）、`validator`（校验）、`dashmap`（无锁并发表）、`arc-swap`（无锁句柄）、`bytes`（零拷贝广播）、`tracing`（结构化日志）。
 
 ---
 
 ## 12. 设计取舍小结
 
 1. 协议两层模型：WebSocket 二进制帧承载 WSCALL 帧，WSCALL 帧负载承载 JSON 信封。
-2. 加密在协议层统一处理，业务层无感。
+2. 加密在协议层统一处理，业务层无感。支持 PSK 预共享密钥与 ECDH 动态密钥协商两种模式，前者适合可信内网，后者适合零信任场景。
 3. 文件走内联 Base64，优先协议统一与接口简洁。
 4. 服务端采用“读循环解码 + 信号量受限并发 handler + 预编码出站”模型，兼顾吞吐与背压。
 5. 客户端采用“无锁 pending 表 + 无锁出站句柄 + 并发事件 handler + 指数退避抖动”模型，兼顾并发与稳定重连。

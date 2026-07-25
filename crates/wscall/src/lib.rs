@@ -21,6 +21,7 @@ pub mod protocol {
 pub use wscall_protocol::{
     EncryptionKind, ErrorPayload, FileAttachment, FrameCodec, MessageType, PacketBody,
     PacketEnvelope, ProtocolError,
+    EcdhKeypair, ECDH_DOMAIN_TAG, ECDH_KEY_LEN, derive_session_key, parse_peer_public,
 };
 
 #[cfg(feature = "server")]
