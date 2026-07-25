@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and the project follows Semantic Versioning.
 
+## [0.3.0] - 2026-07-26
+
+### Added
+
+1. **ECDH dynamic key agreement** — X25519-based per-connection session key negotiation. No pre-shared key required; each connection derives a unique 32-byte ChaCha20-Poly1305 key via `SHA-256("wscall-ecdh-v1" || shared_secret)`.
+2. `WscallServer::with_ecdh()` builder to enable ECDH mode on the server.
+3. `WscallClient::connect_with_ecdh(url)` for ECDH client connections.
+4. `EcdhKeypair` type in `wscall-protocol` for X25519 keypair generation and session key derivation.
+5. `derive_session_key(shared_secret)` and `parse_peer_public(bytes)` helper functions in `wscall-protocol`.
+6. `ECDH_DOMAIN_TAG` and `ECDH_KEY_LEN` constants in `wscall-protocol`.
+7. `ServerOutbound::Packet` variant for per-connection codec encoding in ECDH mode.
+8. `ClientEntry` struct in `wscall-server` storing per-connection codec and encryption kind.
+9. `ProtocolError::InvalidEcdhPublicKey` and `ProtocolError::EcdhHandshake` error variants.
+10. `--ecdh` command-line flag on `demo_server` and `demo_client` examples for ECDH mode.
+11. ECDH re-export in the `wscall` facade crate (`EcdhKeypair`, `ECDH_DOMAIN_TAG`, `ECDH_KEY_LEN`, `derive_session_key`, `parse_peer_public`).
+
+### Changed
+
+1. Server connection table now stores `ClientEntry` (sender + optional per-connection codec + encryption) instead of bare `mpsc::Sender`.
+2. In ECDH mode, `broadcast_event` and `send_event_to` dispatch `ServerOutbound::Packet` so the writer task encodes with the per-connection session codec.
+3. New workspace dependencies: `x25519-dalek` (ECDH) and `sha2` (session key KDF).
+
+### Security
+
+1. ECDH mode provides forward secrecy: each connection uses a fresh X25519 keypair; reconnects generate new session keys automatically.
+2. Session keys are never transmitted over the wire — only public keys are exchanged.
+
 ## [0.2.0] - 2026-07-25
 
 ### Breaking Changes

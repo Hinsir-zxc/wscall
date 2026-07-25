@@ -474,28 +474,21 @@ impl WscallServer {
 
         // ECDH handshake: exchange X25519 public keys and derive a per-
         // connection session key before splitting the stream.
-        let (session_codec, session_encryption) = if self.is_ecdh {
-            self.perform_ecdh_handshake(&mut websocket).await?
+        let session_codec = if self.is_ecdh {
+            let (codec, _encryption) = self.perform_ecdh_handshake(&mut websocket).await?;
+            codec
         } else {
-            (self.codec.clone(), self.default_encryption)
+            self.codec.clone()
         };
 
         let (mut sink, mut stream) = websocket.split();
         let (tx, mut rx) = mpsc::channel::<ServerOutbound>(SERVER_OUTBOUND_QUEUE_CAPACITY);
 
-        // Store the per-connection entry. In ECDH mode each entry carries its
-        // own codec; in PSK mode the entry falls back to the global codec.
-        let entry_codec = if self.is_ecdh {
-            Some(session_codec.clone())
-        } else {
-            None
-        };
+        // Store the per-connection entry.
         self.state.clients.insert(
             connection_id.clone(),
             ClientEntry {
                 sender: tx.clone(),
-                codec: entry_codec,
-                encryption: session_encryption,
             },
         );
 
@@ -644,26 +637,18 @@ impl WscallServer {
         let keypair = EcdhKeypair::generate()?;
 
         // 2. Read the client's public key (first binary WebSocket message).
-        let client_public = loop {
-            let next = timeout(Duration::from_secs(10), websocket.next()).await;
-            match next {
-                Ok(Some(Ok(Message::Binary(bytes)))) => {
-                    match parse_peer_public(&bytes) {
-                        Ok(key) => break key,
-                        Err(_) => {
-                            return Err(ProtocolError::EcdhHandshake(
-                                "client sent invalid public key length".to_string(),
-                            )
-                            .into());
-                        }
-                    }
-                }
-                _ => {
-                    return Err(ProtocolError::EcdhHandshake(
-                        "client did not send a valid public key".to_string(),
-                    )
-                    .into());
-                }
+        let next = timeout(Duration::from_secs(10), websocket.next()).await;
+        let client_public = match next {
+            Ok(Some(Ok(Message::Binary(bytes)))) => parse_peer_public(&bytes).map_err(|_| {
+                ServerError::Protocol(ProtocolError::EcdhHandshake(
+                    "client sent invalid public key length".to_string(),
+                ))
+            })?,
+            _ => {
+                return Err(ProtocolError::EcdhHandshake(
+                    "client did not send a valid public key".to_string(),
+                )
+                .into());
             }
         };
 

@@ -1560,7 +1560,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "wscall"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "futures-util",
  "regex",
@@ -1577,7 +1577,7 @@ dependencies = [
 
 [[package]]
 name = "wscall-client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arc-swap",
  "dashmap",
@@ -1594,7 +1594,7 @@ dependencies = [
 
 [[package]]
 name = "wscall-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -1609,7 +1609,7 @@ dependencies = [
 
 [[package]]
 name = "wscall-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "dashmap",

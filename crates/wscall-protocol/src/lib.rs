@@ -47,8 +47,7 @@ impl EcdhKeypair {
     /// Generates a random X25519 keypair using the platform CSPRNG.
     pub fn generate() -> Result<Self, ProtocolError> {
         let mut secret_bytes = [0u8; ECDH_KEY_LEN];
-        getrandom(&mut secret_bytes)
-            .map_err(|source| ProtocolError::Random(source.to_string()))?;
+        getrandom(&mut secret_bytes).map_err(|source| ProtocolError::Random(source.to_string()))?;
         let secret = StaticSecret::from(secret_bytes);
         let public = PublicKey::from(&secret);
         Ok(Self { secret, public })

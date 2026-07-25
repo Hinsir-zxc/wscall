@@ -16,8 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         WscallClient::connect_with_ecdh("ws://127.0.0.1:9001/socket").await?
     } else {
         println!("connecting in PSK mode (ChaCha20)");
-        WscallClient::connect_with_chacha20("ws://127.0.0.1:9001/socket", DEMO_CHACHA20_KEY)
-            .await?
+        WscallClient::connect_with_chacha20("ws://127.0.0.1:9001/socket", DEMO_CHACHA20_KEY).await?
     };
 
     client

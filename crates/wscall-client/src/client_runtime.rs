@@ -71,7 +71,14 @@ pub struct WscallClient {
 
 impl WscallClient {
     pub async fn connect(url: &str) -> Result<Self, ClientError> {
-        Self::connect_with_settings(url, FrameCodec::plaintext(), EncryptionKind::None, true, false).await
+        Self::connect_with_settings(
+            url,
+            FrameCodec::plaintext(),
+            EncryptionKind::None,
+            true,
+            false,
+        )
+        .await
     }
 
     /// Connect with explicit control over auto-reconnect behavior.
@@ -493,15 +500,13 @@ impl WscallClient {
                 .map_err(|e| ClientError::ConnectionClosed(e.to_string()))?;
 
             // Read the server's 32-byte public key.
-            let server_public = loop {
-                let next = timeout(Duration::from_secs(10), socket.next()).await;
-                match next {
-                    Ok(Some(Ok(Message::Binary(bytes)))) => break parse_peer_public(&bytes)?,
-                    _ => {
-                        return Err(ClientError::ConnectionClosed(
-                            "ECDH handshake failed: no valid server public key".to_string(),
-                        ))
-                    }
+            let next = timeout(Duration::from_secs(10), socket.next()).await;
+            let server_public = match next {
+                Ok(Some(Ok(Message::Binary(bytes)))) => parse_peer_public(&bytes)?,
+                _ => {
+                    return Err(ClientError::ConnectionClosed(
+                        "ECDH handshake failed: no valid server public key".to_string(),
+                    ));
                 }
             };
 
