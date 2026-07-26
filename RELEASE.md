@@ -9,7 +9,7 @@ This workspace publishes a crate family with dependency ordering:
 
 Current target release: `0.4.0`
 
-> **⚠️ BREAKING RELEASE / 破坏性更新**：`0.4.0` 将交互协议升级为“协议版本二”（二进制复合帧），并移除 `si` 字段、将事件 `d` 收紧为 JSON 对象，与 `0.3.0` 及更早版本不兼容。发布说明（GitHub Release / crates.io 版本说明）必须明确标注 BREAKING，并提醒用户四个 crate 需同时升级、配套使用支持协议版本二的 `wscall-client-js`。详见 `CHANGELOG.md` 的 `[0.4.0]` 条目。
+> **⚠️ BREAKING RELEASE**: `0.4.0` upgrades the wire protocol to "protocol v2" (binary composite frames), removes the `si` field, and tightens event `d` to a JSON object. It is incompatible with `0.3.0` and earlier. Release notes (GitHub Release / crates.io version notes) must be clearly labeled BREAKING and remind users to upgrade all four crates together and to use a `wscall-client-js` build that supports protocol v2. See the `[0.4.0]` entry in `CHANGELOG.md` for details.
 
 ## Pre-release checks
 
