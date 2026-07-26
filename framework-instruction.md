@@ -17,7 +17,7 @@ WSCALL 在原生 WebSocket 之上承载一套自有的二进制帧协议，将�
 当前边界：
 
 - 提供 Rust 服务端、Rust 客户端与 JavaScript 客户端 SDK（`wscall-client-js`）。
-- 文件传输走“内联附件 + Base64”，适合轻量文件；大文件分块流式上传未纳入框架核心。
+- 文件传输走“二进制复合帧 + 原始字节附件”（协议 v2），零 Base64 开销；大文件分块流式上传未纳入框架核心。
 
 ---
 
@@ -55,7 +55,7 @@ wscall = { version = "0.1.1", features = ["full"] }
 
 ## 3. 交互协议
 
-### 3.1 帧格式
+### 3.1 帧格式（协议 v2）
 
 双向传输均为如下二进制帧：
 
@@ -66,9 +66,33 @@ wscall = { version = "0.1.1", features = ["full"] }
 - `frame_len`：后续 `message_type + encryption + payload` 的总长度。
 - `message_type`：`0x00` = API（请求/响应）；`0x01` = 事件（发送/回执）。
 - `encryption`：`0x00` = 明文；`0x01` = ChaCha20-Poly1305；`0x02` = AES-256-GCM。
-- 明文模式下 `payload` 为 JSON 序列化后的信封对象。
-- 加密模式下 `payload` 为 `12 字节 nonce + 密文(含 tag)`。
-- **负载上限**：`10 * 1024 * 1024 - 6` 字节，整帧上限 10 MiB，超限即拒绝编解码。
+- 明文模式下 `payload` 为复合负载（见下）。
+- 加密模式下 `payload` 为 `12 字节 nonce + 密文(含 tag)`，解密后为复合负载。
+
+**复合负载结构**（解密后）：
+
+```
+| meta_len:u32(be) | JSON_bytes[meta_len] | att_count:u8 | [att_0] ... [att_N] |
+```
+
+- `meta_len`：JSON 元数据字节长度。
+- `JSON_bytes`：PacketBody 序列化结果，`a` 字段省略（附件由二进制段承载）。
+- `att_count`：附件数量（0~255）。
+- 无附件时仅多 5 字节开销。
+
+**单个附件二进制段**：
+
+```
+| id_len:u8 | id | name_len:u8 | name | ct_len:u8 | content_type | data_len:u32(be) | raw_data |
+```
+
+- 所有字符串为 UTF-8 原始字节，无 Base64。
+- 附件以原始二进制传输，消除协议 v1 中 33% 的 Base64 流量膨胀。
+
+**帧大小限制**：
+
+- 服务端通过 `with_max_frame_bytes(n)` 配置，默认 **100 MiB**。
+- 超限帧触发 413 错误响应帧（`request_id=0`，`code="frame_too_large"`），连接保持打开。
 
 ### 3.2 JSON 信封
 
@@ -82,12 +106,10 @@ wscall = { version = "0.1.1", features = ["full"] }
 | `i` | id | 请求ID / 事件ID（per-connection u64 计数器，JSON 数字） | 全部 |
 | `r` | route | API 路由路径 | ApiRequest |
 | `p` | params | API 请求参数 | ApiRequest |
-| `a` | attachments | 附件列表 | ApiRequest, EventEmit |
-| `m` | metadata | 元数据 | ApiRequest, ApiResponse, EventEmit |
+| `m` | metadata | 元数据（可选，为空时省略） | ApiRequest, ApiResponse, EventEmit |
 | `n` | name | 事件名称 | EventEmit |
-| `d` | data | 事件数据 | EventEmit |
+| `d` | data | 事件数据（JSON 对象） | EventEmit |
 | `e` | expect_ack | 是否期待回执 | EventEmit |
-| `si` | storage_id | 存储ID（可选，事件被数据库等持久化获得的ID） | EventEmit |
 | `o` | ok | 是否成功 | ApiResponse, EventAck |
 | `s` | status | HTTP 状态码 | ApiResponse |
 | `d` | data | 响应数据 | ApiResponse |
@@ -97,25 +119,19 @@ wscall = { version = "0.1.1", features = ["full"] }
 API 请求：
 
 ```json
-{"k":0,"i":1,"r":"system.echo","p":{"message":"hello"},"a":[],"m":{}}
+{"k":0,"i":1,"r":"system.echo","p":{"message":"hello"}}
 ```
 
 API 响应：
 
 ```json
-{"k":2,"i":1,"o":true,"s":200,"d":{"echo":"hello"},"m":{}}
+{"k":2,"i":1,"o":true,"s":200,"d":{"echo":"hello"}}
 ```
 
 事件发送：
 
 ```json
-{"k":1,"i":2,"n":"chat.message","d":"hello","a":[],"m":{},"e":true}
-```
-
-带存储ID的事件（服务端推送已持久化的消息）：
-
-```json
-{"k":1,"i":3,"n":"chat.message","d":"hello","a":[],"m":{},"e":true,"si":101}
+{"k":1,"i":2,"n":"chat.message","d":{"message":"hello"},"e":true}
 ```
 
 事件回执：
@@ -124,7 +140,7 @@ API 响应：
 {"k":3,"i":2,"o":true,"rc":{"ok":true}}
 ```
 
-`PacketBody` 共四种变体：`ApiRequest`(`k=0`) / `EventEmit`(`k=1`) / `ApiResponse`(`k=2`) / `EventAck`(`k=3`)，由数字 `k` 字段区分。`error`(`er`) 字段仅在出错时出现，成功时省略以节省流量。`storage_id`(`si`) 字段仅在事件携带持久化存储ID时出现。
+`PacketBody` 共四种变体：`ApiRequest`(`k=0`) / `EventEmit`(`k=1`) / `ApiResponse`(`k=2`) / `EventAck`(`k=3`)，由数字 `k` 字段区分。`error`(`er`) 字段仅在出错时出现，成功时省略以节省流量。事件数据 `d` 恒为 JSON 对象。
 
 ### 3.3 加密与密钥协商
 
@@ -151,11 +167,12 @@ API 响应：
 
 ### 3.4 文件参数策略
 
-JSON 传参与文件混合采用“参数引用 + 附件列表”：
+JSON 传参与文件混合采用“参数引用 + 二进制附件段”（协议 v2）：
 
 - `params` / `data` 中以 `{"$file": "attachment-id"}` 引用附件。
-- `attachments` 数组携带文件元数据与 Base64 内容。
-- `FileAttachment::inline_text` / `inline_bytes` 构造；`decode_bytes` 还原。
+- 附件以原始二进制段追加在 JSON 元数据之后，零 Base64 开销。
+- `FileAttachment::inline_text` / `inline_bytes` 构造；直接访问 `.data` 获取原始字节。
+- 单个附件 id/name/content_type 长度上限 255 字节，附件数量上限 255。
 
 ---
 
@@ -194,12 +211,10 @@ server.listen("127.0.0.1:9001").await?;
 
 ### 4.4 事件与服务端推送
 
-- `event_handler(name, handler)`：注册客户端发出的事件处理，返回回执 `Value`。`EventContext` 含 `event_id()`、`name()`、`data()`、`storage_id()`、`attachments()`、`metadata()`、`connection_id()`、`peer_addr()`、`server()` 等。
+- `event_handler(name, handler)`：注册客户端发出的事件处理，返回回执 `Value`。`EventContext` 含 `event_id()`、`name()`、`data()`（返回 `&Map<String, Value>`）、`attachments()`、`metadata()`、`connection_id()`、`peer_addr()`、`server()` 等。
 - `ServerHandle`（经 `ctx.server()` 或 `server.handle()` 获得）：
-  - `broadcast_event(name, data, attachments)`：广播给所有连接。
-  - `broadcast_persisted_event(name, data, attachments, storage_id)`：广播已持久化事件，携带 `si` 字段。
-  - `send_event_to(connection_id, name, data, attachments)`：定向推送。
-  - `send_persisted_event_to(connection_id, name, data, attachments, storage_id)`：定向推送已持久化事件，携带 `si` 字段。
+  - `broadcast_event(name, data, attachments)`：广播给所有连接，`data` 为 `Map<String, Value>`。
+  - `send_event_to(connection_id, name, data, attachments)`：定向推送，`data` 为 `Map<String, Value>`。
   - `connection_count()`：当前连接数。
 
 ### 4.5 连接生命周期
@@ -375,7 +390,7 @@ cargo run --example demo_client --features client -- --ecdh
 | client | `default_timeout` | 10s | API/事件调用默认超时 |
 | client | `CLIENT_RECONNECT_BASE_DELAY_SECS` | 3s | 重连退避基数 |
 | client | `CLIENT_RECONNECT_MAX_DELAY_SECS` | 30s | 重连退避上限 |
-| protocol | `MAX_FRAME_BYTES` | 10 MiB | 整帧大小上限 |
+| protocol | `DEFAULT_MAX_FRAME_BYTES` | 100 MiB | 默认整帧大小上限（服务端可通过 `with_max_frame_bytes(n)` 覆盖） |
 
 ---
 
@@ -401,9 +416,9 @@ cargo test --workspace --all-features
 
 ## 12. 设计取舍小结
 
-1. 协议两层模型：WebSocket 二进制帧承载 WSCALL 帧，WSCALL 帧负载承载 JSON 信封。
+1. 协议两层模型：WebSocket 二进制帧承载 WSCALL 帧，WSCALL 帧负载承载复合结构（JSON 元数据 + 二进制附件段）。
 2. 加密在协议层统一处理，业务层无感。支持 PSK 预共享密钥与 ECDH 动态密钥协商两种模式，前者适合可信内网，后者适合零信任场景。
-3. 文件走内联 Base64，优先协议统一与接口简洁。
+3. 文件走二进制复合帧（协议 v2），附件以原始字节传输，消除 Base64 的 33% 流量膨胀。
 4. 服务端采用“读循环解码 + 信号量受限并发 handler + 预编码出站”模型，兼顾吞吐与背压。
 5. 客户端采用“无锁 pending 表 + 无锁出站句柄 + 并发事件 handler + 指数退避抖动”模型，兼顾并发与稳定重连。
 6. 库内日志统一 `tracing`，热路径无同步 IO 阻塞。

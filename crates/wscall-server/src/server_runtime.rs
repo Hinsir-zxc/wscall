@@ -8,16 +8,19 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{MissedTickBehavior, interval, timeout};
-use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
+use tokio_tungstenite::{
+    WebSocketStream, accept_async_with_config, tungstenite::Message,
+    tungstenite::protocol::WebSocketConfig,
+};
 use uuid::Uuid;
 use validator::Validate;
 use wscall_protocol::{
-    EcdhKeypair, EncryptionKind, ErrorPayload, FileAttachment, FrameCodec, PacketBody,
-    PacketEnvelope, ProtocolError, parse_peer_public,
+    DEFAULT_MAX_FRAME_BYTES, EcdhKeypair, EncryptionKind, ErrorPayload, FileAttachment, FrameCodec,
+    PacketBody, PacketEnvelope, ProtocolError, parse_peer_public,
 };
 
 use crate::server_types::{
@@ -57,10 +60,9 @@ struct ApiRequestInput {
 struct EventEmitInput {
     event_id: u64,
     name: String,
-    data: Value,
+    data: Map<String, Value>,
     attachments: Vec<FileAttachment>,
     metadata: Value,
-    storage_id: Option<u64>,
 }
 
 impl ServerHandle {
@@ -73,32 +75,8 @@ impl ServerHandle {
     pub async fn broadcast_event(
         &self,
         name: impl Into<String>,
-        data: Value,
+        data: Map<String, Value>,
         attachments: Vec<FileAttachment>,
-    ) -> Result<(), ApiError> {
-        self.broadcast_event_inner(name, data, attachments, None)
-            .await
-    }
-
-    /// Broadcasts a persisted event to every live connection, carrying a
-    /// storage id (`si` field) assigned by a database or other persistent store.
-    pub async fn broadcast_persisted_event(
-        &self,
-        name: impl Into<String>,
-        data: Value,
-        attachments: Vec<FileAttachment>,
-        storage_id: u64,
-    ) -> Result<(), ApiError> {
-        self.broadcast_event_inner(name, data, attachments, Some(storage_id))
-            .await
-    }
-
-    async fn broadcast_event_inner(
-        &self,
-        name: impl Into<String>,
-        data: Value,
-        attachments: Vec<FileAttachment>,
-        storage_id: Option<u64>,
     ) -> Result<(), ApiError> {
         let event_id = self.state.next_event_id.fetch_add(1, Ordering::Relaxed) + 1;
         let packet = PacketEnvelope::with_encryption(
@@ -109,7 +87,6 @@ impl ServerHandle {
                 attachments,
                 metadata: json!({ "source": "server" }),
                 expect_ack: true,
-                storage_id,
             },
             self.default_encryption,
         );
@@ -160,34 +137,8 @@ impl ServerHandle {
         &self,
         connection_id: &str,
         name: impl Into<String>,
-        data: Value,
+        data: Map<String, Value>,
         attachments: Vec<FileAttachment>,
-    ) -> Result<(), ApiError> {
-        self.send_event_to_inner(connection_id, name, data, attachments, None)
-            .await
-    }
-
-    /// Sends a persisted event to a single connection by id, carrying a
-    /// storage id (`si` field) assigned by a database or other persistent store.
-    pub async fn send_persisted_event_to(
-        &self,
-        connection_id: &str,
-        name: impl Into<String>,
-        data: Value,
-        attachments: Vec<FileAttachment>,
-        storage_id: u64,
-    ) -> Result<(), ApiError> {
-        self.send_event_to_inner(connection_id, name, data, attachments, Some(storage_id))
-            .await
-    }
-
-    async fn send_event_to_inner(
-        &self,
-        connection_id: &str,
-        name: impl Into<String>,
-        data: Value,
-        attachments: Vec<FileAttachment>,
-        storage_id: Option<u64>,
     ) -> Result<(), ApiError> {
         let event_id = self.state.next_event_id.fetch_add(1, Ordering::Relaxed) + 1;
         let packet = PacketEnvelope::with_encryption(
@@ -198,7 +149,6 @@ impl ServerHandle {
                 attachments,
                 metadata: json!({ "source": "server" }),
                 expect_ack: true,
-                storage_id,
             },
             self.default_encryption,
         );
@@ -250,6 +200,8 @@ pub struct WscallServer {
     max_connections: Option<usize>,
     /// Per-connection cap on concurrently running request/event handlers.
     max_in_flight: usize,
+    /// Maximum total frame size (including 4-byte length prefix).
+    max_frame_bytes: usize,
 }
 
 impl Default for WscallServer {
@@ -273,6 +225,7 @@ impl WscallServer {
             is_ecdh: false,
             max_connections: None,
             max_in_flight: SERVER_DEFAULT_MAX_IN_FLIGHT,
+            max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
         }
     }
 
@@ -317,6 +270,16 @@ impl WscallServer {
     /// single connection, bounding per-connection CPU and memory usage.
     pub fn with_max_in_flight(mut self, max: usize) -> Self {
         self.max_in_flight = max;
+        self
+    }
+
+    /// Sets the maximum total frame size (including the 4-byte length prefix).
+    ///
+    /// Frames exceeding this limit cause the server to send a 413 error response
+    /// frame (`request_id=0`, `code="frame_too_large"`); the connection stays
+    /// open. Default: 100 MiB.
+    pub fn with_max_frame_bytes(mut self, max: usize) -> Self {
+        self.max_frame_bytes = max;
         self
     }
 
@@ -468,7 +431,15 @@ impl WscallServer {
         stream: TcpStream,
         peer: std::net::SocketAddr,
     ) -> Result<(), ServerError> {
-        let mut websocket = accept_async(stream).await?;
+        // Configure WebSocket-level message size limit slightly above the
+        // WSCALL limit so that oversized frames can still be received and
+        // answered with a 413 error response instead of an abrupt close.
+        let ws_config = WebSocketConfig {
+            max_message_size: Some(self.max_frame_bytes + 1024 * 1024),
+            max_frame_size: Some(self.max_frame_bytes + 1024 * 1024),
+            ..Default::default()
+        };
+        let mut websocket = accept_async_with_config(stream, Some(ws_config)).await?;
         let connection_id = Uuid::now_v7().to_string();
         let peer_addr = Some(peer);
 
@@ -476,21 +447,20 @@ impl WscallServer {
         // connection session key before splitting the stream.
         let session_codec = if self.is_ecdh {
             let (codec, _encryption) = self.perform_ecdh_handshake(&mut websocket).await?;
-            codec
+            codec.with_max_frame_bytes(self.max_frame_bytes)
         } else {
-            self.codec.clone()
+            self.codec
+                .clone()
+                .with_max_frame_bytes(self.max_frame_bytes)
         };
 
         let (mut sink, mut stream) = websocket.split();
         let (tx, mut rx) = mpsc::channel::<ServerOutbound>(SERVER_OUTBOUND_QUEUE_CAPACITY);
 
         // Store the per-connection entry.
-        self.state.clients.insert(
-            connection_id.clone(),
-            ClientEntry {
-                sender: tx.clone(),
-            },
-        );
+        self.state
+            .clients
+            .insert(connection_id.clone(), ClientEntry { sender: tx.clone() });
 
         self.notify_connected(&connection_id, peer_addr).await;
 
@@ -546,7 +516,10 @@ impl WscallServer {
                 .send_event_to(
                     &connection_id,
                     "system.notice",
-                    json!({ "message": "connected", "connection_id": connection_id }),
+                    json!({ "message": "connected", "connection_id": connection_id })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
                     Vec::new(),
                 )
                 .await
@@ -562,6 +535,33 @@ impl WscallServer {
 
                 match message? {
                     Message::Binary(bytes) => {
+                        // WSCALL-level frame size check: reject oversized frames
+                        // with a 413 error response; the connection stays open.
+                        if bytes.len() > self.max_frame_bytes {
+                            let error_packet = PacketEnvelope::with_encryption(
+                                PacketBody::ApiResponse {
+                                    request_id: 0,
+                                    ok: false,
+                                    status: 413,
+                                    data: json!({}),
+                                    error: Some(ErrorPayload {
+                                        code: "frame_too_large".to_string(),
+                                        message: format!(
+                                            "frame size {} exceeds limit {}",
+                                            bytes.len(),
+                                            self.max_frame_bytes
+                                        ),
+                                        status: 413,
+                                        details: None,
+                                    }),
+                                    metadata: json!({}),
+                                },
+                                self.default_encryption,
+                            );
+                            let _ = self.queue_for(&connection_id, error_packet).await;
+                            continue;
+                        }
+
                         let packet = reader_codec.decode(&bytes)?;
 
                         let spawn_handler = matches!(
@@ -700,7 +700,6 @@ impl WscallServer {
                 data,
                 attachments,
                 metadata,
-                storage_id,
                 ..
             } => {
                 let ack = self
@@ -713,7 +712,6 @@ impl WscallServer {
                             data,
                             attachments,
                             metadata,
-                            storage_id,
                         },
                     )
                     .await;
@@ -868,7 +866,6 @@ impl WscallServer {
             data,
             attachments,
             metadata,
-            storage_id,
         } = event;
 
         let ctx = EventContext {
@@ -879,7 +876,6 @@ impl WscallServer {
             data,
             attachments,
             metadata,
-            storage_id,
             server: self.handle(),
         };
 

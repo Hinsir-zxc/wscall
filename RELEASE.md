@@ -7,7 +7,9 @@ This workspace publishes a crate family with dependency ordering:
 3. `wscall-client`
 4. `wscall`
 
-Current target release: `0.3.0`
+Current target release: `0.4.0`
+
+> **⚠️ BREAKING RELEASE / 破坏性更新**：`0.4.0` 将交互协议升级为“协议版本二”（二进制复合帧），并移除 `si` 字段、将事件 `d` 收紧为 JSON 对象，与 `0.3.0` 及更早版本不兼容。发布说明（GitHub Release / crates.io 版本说明）必须明确标注 BREAKING，并提醒用户四个 crate 需同时升级、配套使用支持协议版本二的 `wscall-client-js`。详见 `CHANGELOG.md` 的 `[0.4.0]` 条目。
 
 ## Pre-release checks
 
@@ -70,7 +72,7 @@ cargo publish -p wscall
 Run through this list before the first `cargo publish`:
 
 1. Working tree is clean or intentionally dirty for a local dry run.
-2. Workspace version is set to `0.3.0` and internal crate dependency pins also use `0.3.0`.
+2. Workspace version is set to `0.4.0` and internal crate dependency pins also use `0.4.0`.
 3. `CHANGELOG.md` includes the target version notes.
 4. `README.md` quick-start commands still work.
 5. Workspace quality gates pass.

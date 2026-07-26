@@ -36,14 +36,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     client
         .on_event("system.notice", |event| async move {
-            println!("notice: {}", event.data);
+            println!("notice: {}", serde_json::Value::Object(event.data.clone()));
             json!({ "received": true })
         })
         .await;
 
     client
         .on_event("chat.message", |event| async move {
-            println!("chat event: {}", event.data);
+            println!(
+                "chat event: {}",
+                serde_json::Value::Object(event.data.clone())
+            );
             json!({ "seen": true, "event_id": event.event_id })
         })
         .await;
@@ -82,7 +85,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ack = client
         .send_event(
             "chat.message",
-            json!({ "message": "hello room" }),
+            json!({ "message": "hello room" })
+                .as_object()
+                .unwrap()
+                .clone(),
             Vec::new(),
         )
         .await?;

@@ -167,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "id": attachment.id,
                     "name": attachment.name,
                     "content_type": attachment.content_type,
-                    "size": attachment.size,
+                    "size": attachment.size(),
                 })
             })
             .collect::<Vec<_>>();
@@ -207,7 +207,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             history.lock().await.push(record.clone());
             ctx.server()
-                .broadcast_event("chat.message", record.clone(), Vec::<FileAttachment>::new())
+                .broadcast_event(
+                    "chat.message",
+                    record.as_object().unwrap().clone(),
+                    Vec::<FileAttachment>::new(),
+                )
                 .await?;
 
             Ok(json!({ "stored": true, "echo": record }))

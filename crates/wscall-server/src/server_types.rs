@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicU64;
 use bytes::Bytes;
 use dashmap::DashMap;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use validator::Validate;
@@ -255,7 +255,7 @@ impl ApiContext {
                     "id": attachment.id,
                     "name": attachment.name,
                     "content_type": attachment.content_type,
-                    "size": attachment.size,
+                    "size": attachment.size(),
                 })
             })
             .collect()
@@ -269,10 +269,9 @@ pub struct EventContext {
     pub(crate) peer_addr: Option<SocketAddr>,
     pub(crate) event_id: u64,
     pub(crate) name: String,
-    pub(crate) data: Value,
+    pub(crate) data: Map<String, Value>,
     pub(crate) attachments: Vec<FileAttachment>,
     pub(crate) metadata: Value,
-    pub(crate) storage_id: Option<u64>,
     pub(crate) server: ServerHandle,
 }
 
@@ -302,8 +301,8 @@ impl EventContext {
         &self.name
     }
 
-    /// Returns the raw JSON event data.
-    pub fn data(&self) -> &Value {
+    /// Returns the event data object.
+    pub fn data(&self) -> &Map<String, Value> {
         &self.data
     }
 
@@ -315,11 +314,6 @@ impl EventContext {
     /// Returns the raw metadata payload.
     pub fn metadata(&self) -> &Value {
         &self.metadata
-    }
-
-    /// Returns the storage id when the event carries one.
-    pub fn storage_id(&self) -> Option<u64> {
-        self.storage_id
     }
 
     /// Returns a server handle for outbound event operations.

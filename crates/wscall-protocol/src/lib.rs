@@ -7,14 +7,12 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use aes_gcm::{Aes256Gcm, KeyInit as AesKeyInit, Nonce as AesNonce, aead::Aead as AesAead};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use getrandom::getrandom;
 use serde::de::Deserializer;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -100,8 +98,12 @@ pub fn parse_peer_public(bytes: &[u8]) -> Result<[u8; ECDH_KEY_LEN], ProtocolErr
 
 const AES256_NONCE_LEN: usize = 12;
 const CHACHA20_NONCE_LEN: usize = 12;
-const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
-const MAX_PAYLOAD_BYTES: usize = MAX_FRAME_BYTES - 6;
+
+/// Default maximum frame size: 100 MiB.
+///
+/// This is no longer a hard protocol constant; the server configures it via
+/// `WscallServer::with_max_frame_bytes(n)` and the codec carries the value.
+pub const DEFAULT_MAX_FRAME_BYTES: usize = 100 * 1024 * 1024;
 
 /// Distinguishes API messages from event messages inside a WSCALL frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,7 +152,11 @@ impl TryFrom<u8> for EncryptionKind {
     }
 }
 
-/// Inline attachment carried alongside JSON params or event data.
+/// Binary attachment carried alongside JSON params or event data.
+///
+/// In protocol v2 the attachment payload is stored as raw bytes in a binary
+/// section appended after the JSON metadata, eliminating the 33% overhead of
+/// Base64 encoding used in protocol v1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileAttachment {
     /// Attachment identifier referenced from JSON using `{ "$file": "..." }`.
@@ -159,16 +165,12 @@ pub struct FileAttachment {
     pub name: String,
     /// MIME type supplied by the sender.
     pub content_type: String,
-    /// Content transfer encoding. Current implementation uses Base64.
-    pub encoding: String,
-    /// Encoded attachment payload.
-    pub data: String,
-    /// Original byte length before encoding.
-    pub size: usize,
+    /// Raw attachment payload bytes.
+    pub data: Vec<u8>,
 }
 
 impl FileAttachment {
-    /// Builds an inline text attachment and encodes it as Base64.
+    /// Builds a text attachment from a string.
     pub fn inline_text(
         id: impl Into<String>,
         name: impl Into<String>,
@@ -178,34 +180,129 @@ impl FileAttachment {
         Self::inline_bytes(id, name, content_type, text.as_ref().as_bytes().to_vec())
     }
 
-    /// Builds an inline binary attachment and encodes it as Base64.
+    /// Builds a binary attachment from raw bytes.
     pub fn inline_bytes(
         id: impl Into<String>,
         name: impl Into<String>,
         content_type: impl Into<String>,
         bytes: Vec<u8>,
     ) -> Self {
-        let size = bytes.len();
         Self {
             id: id.into(),
             name: name.into(),
             content_type: content_type.into(),
-            encoding: "base64".to_string(),
-            data: BASE64.encode(bytes),
-            size,
+            data: bytes,
         }
     }
 
-    /// Decodes the attachment payload back into raw bytes.
-    pub fn decode_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
-        BASE64
-            .decode(self.data.as_bytes())
-            .map_err(|source| ProtocolError::InvalidAttachmentEncoding(source.to_string()))
+    /// Returns the byte length of the attachment payload.
+    pub fn size(&self) -> usize {
+        self.data.len()
     }
 
     /// Returns a JSON reference object that points to an attachment by id.
     pub fn param_ref(id: impl Into<String>) -> Value {
         json!({ "$file": id.into() })
+    }
+
+    /// Computes the total wire size of this attachment's binary section.
+    ///
+    /// Layout: id_len:u8 + id + name_len:u8 + name + ct_len:u8 + ct + data_len:u32 + data
+    pub(crate) fn wire_size(&self) -> usize {
+        1 + self.id.len() + 1 + self.name.len() + 1 + self.content_type.len() + 4 + self.data.len()
+    }
+
+    /// Appends this attachment's binary section to `buf`.
+    pub(crate) fn write_wire(&self, buf: &mut Vec<u8>) {
+        buf.push(self.id.len() as u8);
+        buf.extend_from_slice(self.id.as_bytes());
+        buf.push(self.name.len() as u8);
+        buf.extend_from_slice(self.name.as_bytes());
+        buf.push(self.content_type.len() as u8);
+        buf.extend_from_slice(self.content_type.as_bytes());
+        buf.extend_from_slice(&(self.data.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&self.data);
+    }
+
+    /// Parses one attachment binary section from `data`, returning the
+    /// attachment and the remaining unconsumed bytes.
+    pub(crate) fn read_wire(data: &[u8]) -> Result<(Self, &[u8]), ProtocolError> {
+        let mut pos = 0;
+
+        // id
+        if pos >= data.len() {
+            return Err(ProtocolError::InvalidAttachmentEncoding(
+                "truncated id_len".into(),
+            ));
+        }
+        let id_len = data[pos] as usize;
+        pos += 1;
+        if pos + id_len > data.len() {
+            return Err(ProtocolError::InvalidAttachmentEncoding(
+                "truncated id".into(),
+            ));
+        }
+        let id = String::from_utf8_lossy(&data[pos..pos + id_len]).into_owned();
+        pos += id_len;
+
+        // name
+        if pos >= data.len() {
+            return Err(ProtocolError::InvalidAttachmentEncoding(
+                "truncated name_len".into(),
+            ));
+        }
+        let name_len = data[pos] as usize;
+        pos += 1;
+        if pos + name_len > data.len() {
+            return Err(ProtocolError::InvalidAttachmentEncoding(
+                "truncated name".into(),
+            ));
+        }
+        let name = String::from_utf8_lossy(&data[pos..pos + name_len]).into_owned();
+        pos += name_len;
+
+        // content_type
+        if pos >= data.len() {
+            return Err(ProtocolError::InvalidAttachmentEncoding(
+                "truncated ct_len".into(),
+            ));
+        }
+        let ct_len = data[pos] as usize;
+        pos += 1;
+        if pos + ct_len > data.len() {
+            return Err(ProtocolError::InvalidAttachmentEncoding(
+                "truncated content_type".into(),
+            ));
+        }
+        let content_type = String::from_utf8_lossy(&data[pos..pos + ct_len]).into_owned();
+        pos += ct_len;
+
+        // data
+        if pos + 4 > data.len() {
+            return Err(ProtocolError::InvalidAttachmentEncoding(
+                "truncated data_len".into(),
+            ));
+        }
+        let data_len =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+        if pos + data_len > data.len() {
+            return Err(ProtocolError::InvalidAttachmentEncoding(
+                "truncated data".into(),
+            ));
+        }
+        let payload = data[pos..pos + data_len].to_vec();
+        pos += data_len;
+
+        Ok((
+            Self {
+                id,
+                name,
+                content_type,
+                data: payload,
+            },
+            &data[pos..],
+        ))
     }
 }
 
@@ -235,7 +332,7 @@ pub const K_EVENT_ACK: u8 = 3;
 /// | Variant | `k` | Fields |
 /// | --- | --- | --- |
 /// | `ApiRequest`  | 0 | `i` `r` `p` `a` `m` |
-/// | `EventEmit`   | 1 | `i` `n` `d` `a` `m` `e` [`si`] |
+/// | `EventEmit`   | 1 | `i` `n` `d` `a` `m` `e` |
 /// | `ApiResponse` | 2 | `i` `o` `s` `d` `m` [`er`] |
 /// | `EventAck`    | 3 | `i` `o` `rc` [`er`] |
 #[derive(Debug, Clone)]
@@ -258,16 +355,15 @@ pub enum PacketBody {
         metadata: Value,
     },
     /// Event emission in either direction.
+    ///
+    /// The `data` payload is always a JSON object (never a scalar or string).
     EventEmit {
         event_id: u64,
         name: String,
-        data: Value,
+        data: Map<String, Value>,
         attachments: Vec<FileAttachment>,
         metadata: Value,
         expect_ack: bool,
-        /// Storage ID assigned by a database or other persistent store.
-        /// Serialized as `"si"` when present, omitted when `None`.
-        storage_id: Option<u64>,
     },
     /// Acknowledgement for an emitted event.
     EventAck {
@@ -280,6 +376,11 @@ pub enum PacketBody {
 
 // --- Manual Serialize: short keys + numeric `k` tag -------------------------
 
+/// Returns `true` when the metadata value carries no information (null or `{}`).
+fn metadata_is_empty(v: &Value) -> bool {
+    matches!(v, Value::Null) || v.as_object().is_some_and(|m| m.is_empty())
+}
+
 impl Serialize for PacketBody {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -290,16 +391,19 @@ impl Serialize for PacketBody {
                 request_id,
                 route,
                 params,
-                attachments,
+                attachments: _,
                 metadata,
             } => {
-                let mut s = serializer.serialize_map(Some(6))?;
+                let include_meta = !metadata_is_empty(metadata);
+                let field_count = 4 + usize::from(include_meta);
+                let mut s = serializer.serialize_map(Some(field_count))?;
                 s.serialize_entry("k", &K_API_REQUEST)?;
                 s.serialize_entry("i", request_id)?;
                 s.serialize_entry("r", route)?;
                 s.serialize_entry("p", params)?;
-                s.serialize_entry("a", attachments)?;
-                s.serialize_entry("m", metadata)?;
+                if include_meta {
+                    s.serialize_entry("m", metadata)?;
+                }
                 s.end()
             }
             Self::ApiResponse {
@@ -310,7 +414,8 @@ impl Serialize for PacketBody {
                 error,
                 metadata,
             } => {
-                let field_count = 5 + usize::from(error.is_some()) + 1;
+                let include_meta = !metadata_is_empty(metadata);
+                let field_count = 5 + usize::from(error.is_some()) + usize::from(include_meta);
                 let mut s = serializer.serialize_map(Some(field_count))?;
                 s.serialize_entry("k", &K_API_RESPONSE)?;
                 s.serialize_entry("i", request_id)?;
@@ -320,30 +425,30 @@ impl Serialize for PacketBody {
                 if let Some(err) = error {
                     s.serialize_entry("er", err)?;
                 }
-                s.serialize_entry("m", metadata)?;
+                if include_meta {
+                    s.serialize_entry("m", metadata)?;
+                }
                 s.end()
             }
             Self::EventEmit {
                 event_id,
                 name,
                 data,
-                attachments,
+                attachments: _,
                 metadata,
                 expect_ack,
-                storage_id,
             } => {
-                let field_count = 7 + usize::from(storage_id.is_some());
+                let include_meta = !metadata_is_empty(metadata);
+                let field_count = 5 + usize::from(include_meta);
                 let mut s = serializer.serialize_map(Some(field_count))?;
                 s.serialize_entry("k", &K_EVENT_EMIT)?;
                 s.serialize_entry("i", event_id)?;
                 s.serialize_entry("n", name)?;
                 s.serialize_entry("d", data)?;
-                s.serialize_entry("a", attachments)?;
-                s.serialize_entry("m", metadata)?;
-                s.serialize_entry("e", expect_ack)?;
-                if let Some(si) = storage_id {
-                    s.serialize_entry("si", si)?;
+                if include_meta {
+                    s.serialize_entry("m", metadata)?;
                 }
+                s.serialize_entry("e", expect_ack)?;
                 s.end()
             }
             Self::EventAck {
@@ -409,15 +514,13 @@ struct EventEmitFields {
     #[serde(rename = "n")]
     name: String,
     #[serde(rename = "d", default)]
-    data: Value,
+    data: Map<String, Value>,
     #[serde(rename = "a", default)]
     attachments: Vec<FileAttachment>,
     #[serde(rename = "m", default)]
     metadata: Value,
     #[serde(rename = "e", default)]
     expect_ack: bool,
-    #[serde(rename = "si", default)]
-    storage_id: Option<u64>,
 }
 
 /// Deserialization helper for [`PacketBody::EventAck`].
@@ -470,7 +573,6 @@ impl<'de> Deserialize<'de> for PacketBody {
                     attachments: f.attachments,
                     metadata: f.metadata,
                     expect_ack: f.expect_ack,
-                    storage_id: f.storage_id,
                 })
             }
             K_API_RESPONSE => {
@@ -507,6 +609,24 @@ impl PacketBody {
             Self::EventEmit { .. } | Self::EventAck { .. } => MessageType::Event,
         }
     }
+
+    /// Returns the attachments carried by this packet (empty for responses/acks).
+    pub fn attachments(&self) -> &[FileAttachment] {
+        match self {
+            Self::ApiRequest { attachments, .. } => attachments,
+            Self::EventEmit { attachments, .. } => attachments,
+            _ => &[],
+        }
+    }
+
+    /// Injects decoded binary attachments back into the packet body.
+    pub fn set_attachments(&mut self, attachments: Vec<FileAttachment>) {
+        match self {
+            Self::ApiRequest { attachments: a, .. } => *a = attachments,
+            Self::EventEmit { attachments: a, .. } => *a = attachments,
+            _ => {}
+        }
+    }
 }
 
 /// Full transport envelope before frame encoding.
@@ -540,15 +660,30 @@ impl PacketEnvelope {
     }
 }
 
-/// Encodes and decodes WSCALL binary frames.
+/// Encodes and decodes WSCALL binary frames (protocol v2).
+///
+/// Protocol v2 uses a composite payload format: JSON metadata followed by raw
+/// binary attachment sections, eliminating the Base64 overhead of protocol v1.
 ///
 /// The symmetric ciphers are constructed once when a key is configured and shared
 /// via [`Arc`] across every clone of the codec. This avoids redoing the key
 /// schedule (which for AES-256-GCM is especially expensive) on every frame.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct FrameCodec {
     aes256_cipher: Option<Arc<Aes256Gcm>>,
     chacha20_cipher: Option<Arc<ChaCha20Poly1305>>,
+    /// Maximum total frame size (including the 4-byte length prefix).
+    max_frame_bytes: usize,
+}
+
+impl Default for FrameCodec {
+    fn default() -> Self {
+        Self {
+            aes256_cipher: None,
+            chacha20_cipher: None,
+            max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+        }
+    }
 }
 
 impl std::fmt::Debug for FrameCodec {
@@ -556,6 +691,7 @@ impl std::fmt::Debug for FrameCodec {
         f.debug_struct("FrameCodec")
             .field("aes256", &self.aes256_cipher.is_some())
             .field("chacha20", &self.chacha20_cipher.is_some())
+            .field("max_frame_bytes", &self.max_frame_bytes)
             .finish()
     }
 }
@@ -592,31 +728,64 @@ impl FrameCodec {
         }
     }
 
-    /// Encodes an envelope into a binary WSCALL frame.
-    pub fn encode(&self, packet: &PacketEnvelope) -> Result<Vec<u8>, ProtocolError> {
-        let payload = serde_json::to_vec(&packet.body)?;
+    /// Sets the maximum total frame size (including the 4-byte length prefix).
+    ///
+    /// Frames exceeding this limit are rejected during encode/decode.
+    pub fn with_max_frame_bytes(mut self, max: usize) -> Self {
+        self.max_frame_bytes = max;
+        self
+    }
 
-        // Pre-check the serialized JSON size before doing any crypto work so
-        // that oversized payloads are rejected without paying for encryption.
-        if payload.len() > MAX_PAYLOAD_BYTES {
+    /// Returns the configured maximum frame size.
+    pub fn max_frame_bytes(&self) -> usize {
+        self.max_frame_bytes
+    }
+
+    /// Encodes an envelope into a binary WSCALL frame (protocol v2 composite format).
+    ///
+    /// The composite payload layout (before encryption):
+    /// ```text
+    /// | meta_len:u32(be) | JSON_bytes | att_count:u8 | [att sections...] |
+    /// ```
+    pub fn encode(&self, packet: &PacketEnvelope) -> Result<Vec<u8>, ProtocolError> {
+        let max_payload = self.max_frame_bytes.saturating_sub(6);
+
+        // Serialize JSON metadata (attachments excluded from JSON).
+        let json_bytes = serde_json::to_vec(&packet.body)?;
+
+        // Collect attachments from the packet body.
+        let attachments = packet.body.attachments();
+
+        // Build the composite payload.
+        let mut composite = Vec::with_capacity(
+            4 + json_bytes.len() + 1 + attachments.iter().map(|a| a.wire_size()).sum::<usize>(),
+        );
+        composite.extend_from_slice(&(json_bytes.len() as u32).to_be_bytes());
+        composite.extend_from_slice(&json_bytes);
+        composite.push(attachments.len() as u8);
+        for att in attachments {
+            att.write_wire(&mut composite);
+        }
+
+        // Pre-check size before encryption.
+        if composite.len() > max_payload {
             return Err(ProtocolError::PayloadTooLarge {
-                actual: payload.len(),
-                max: MAX_PAYLOAD_BYTES,
+                actual: composite.len(),
+                max: max_payload,
             });
         }
 
         let payload = match packet.encryption {
-            EncryptionKind::None => payload,
-            EncryptionKind::ChaCha20 => self.encrypt_chacha20(&payload)?,
-            EncryptionKind::Aes256 => self.encrypt_aes256(&payload)?,
+            EncryptionKind::None => composite,
+            EncryptionKind::ChaCha20 => self.encrypt_chacha20(&composite)?,
+            EncryptionKind::Aes256 => self.encrypt_aes256(&composite)?,
         };
 
-        // The encrypted form (nonce + ciphertext + tag) can still overflow the
-        // limit even when the plaintext fit, so guard once more.
-        if payload.len() > MAX_PAYLOAD_BYTES {
+        // Post-encryption size check (nonce + tag add overhead).
+        if payload.len() > max_payload {
             return Err(ProtocolError::PayloadTooLarge {
                 actual: payload.len(),
-                max: MAX_PAYLOAD_BYTES,
+                max: max_payload,
             });
         }
 
@@ -629,7 +798,7 @@ impl FrameCodec {
         Ok(frame)
     }
 
-    /// Decodes a binary WSCALL frame back into an envelope.
+    /// Decodes a binary WSCALL frame back into an envelope (protocol v2 composite format).
     pub fn decode(&self, frame: &[u8]) -> Result<PacketEnvelope, ProtocolError> {
         if frame.len() < 6 {
             return Err(ProtocolError::FrameTooShort);
@@ -641,24 +810,48 @@ impl FrameCodec {
             return Err(ProtocolError::FrameLengthMismatch { declared, actual });
         }
 
-        let payload_len = actual - 2;
-        if payload_len > MAX_PAYLOAD_BYTES {
-            return Err(ProtocolError::PayloadTooLarge {
-                actual: payload_len,
-                max: MAX_PAYLOAD_BYTES,
+        if frame.len() > self.max_frame_bytes {
+            return Err(ProtocolError::FrameTooLarge {
+                actual: frame.len(),
+                max: self.max_frame_bytes,
             });
         }
 
         let message_type = MessageType::try_from(frame[4])?;
         let encryption = EncryptionKind::try_from(frame[5])?;
-        // Borrow the plaintext slice directly instead of cloning it into a Vec.
-        let payload: Cow<'_, [u8]> = match encryption {
+
+        // Decrypt (or borrow) the composite payload.
+        let composite: Cow<'_, [u8]> = match encryption {
             EncryptionKind::None => Cow::Borrowed(&frame[6..]),
             EncryptionKind::ChaCha20 => Cow::Owned(self.decrypt_chacha20(&frame[6..])?),
             EncryptionKind::Aes256 => Cow::Owned(self.decrypt_aes256(&frame[6..])?),
         };
 
-        let body: PacketBody = serde_json::from_slice(&payload)?;
+        // Parse composite: meta_len:u32 | JSON | att_count:u8 | [att sections]
+        if composite.len() < 5 {
+            return Err(ProtocolError::FrameTooShort);
+        }
+        let meta_len =
+            u32::from_be_bytes([composite[0], composite[1], composite[2], composite[3]]) as usize;
+        if composite.len() < 4 + meta_len + 1 {
+            return Err(ProtocolError::FrameTooShort);
+        }
+        let json_slice = &composite[4..4 + meta_len];
+        let att_count = composite[4 + meta_len] as usize;
+        let mut att_data = &composite[4 + meta_len + 1..];
+
+        // Parse binary attachment sections.
+        let mut attachments = Vec::with_capacity(att_count);
+        for _ in 0..att_count {
+            let (att, rest) = FileAttachment::read_wire(att_data)?;
+            attachments.push(att);
+            att_data = rest;
+        }
+
+        // Parse JSON body and inject attachments.
+        let mut body: PacketBody = serde_json::from_slice(json_slice)?;
+        body.set_attachments(attachments);
+
         if body.message_type() != message_type {
             return Err(ProtocolError::MessageTypeMismatch);
         }
@@ -762,6 +955,8 @@ pub enum ProtocolError {
     FrameLengthMismatch { declared: usize, actual: usize },
     #[error("payload too large: actual={actual}, max={max}")]
     PayloadTooLarge { actual: usize, max: usize },
+    #[error("frame too large: actual={actual}, max={max}")]
+    FrameTooLarge { actual: usize, max: usize },
     #[error("unknown message type: {0:#x}")]
     UnknownMessageType(u8),
     #[error("unknown encryption kind: {0:#x}")]
@@ -801,8 +996,8 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::{
-        EncryptionKind, FrameCodec, MAX_PAYLOAD_BYTES, MessageType, PacketBody, PacketEnvelope,
-        ProtocolError, decode_frame, encode_frame,
+        EncryptionKind, FileAttachment, FrameCodec, PacketBody, PacketEnvelope, ProtocolError,
+        decode_frame, encode_frame,
     };
     use serde_json::json;
 
@@ -843,13 +1038,73 @@ mod tests {
     }
 
     #[test]
+    fn attachment_roundtrip_plaintext() {
+        let att = FileAttachment::inline_bytes(
+            "f1",
+            "test.bin",
+            "application/octet-stream",
+            vec![1, 2, 3, 4, 5],
+        );
+        let packet = PacketEnvelope::new(PacketBody::ApiRequest {
+            request_id: 42,
+            route: "files.upload".to_string(),
+            params: json!({ "file": { "$file": "f1" } }),
+            attachments: vec![att],
+            metadata: json!({}),
+        });
+
+        let encoded = encode_frame(&packet).expect("encode with attachment");
+        let decoded = decode_frame(&encoded).expect("decode with attachment");
+
+        let atts = decoded.body.attachments();
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].id, "f1");
+        assert_eq!(atts[0].name, "test.bin");
+        assert_eq!(atts[0].content_type, "application/octet-stream");
+        assert_eq!(atts[0].data, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn attachment_roundtrip_encrypted() {
+        let codec = FrameCodec::plaintext().with_chacha20_key(TEST_KEY);
+        let att = FileAttachment::inline_text("f2", "hello.txt", "text/plain", "hello world");
+        let packet = PacketEnvelope::with_encryption(
+            PacketBody::EventEmit {
+                event_id: 7,
+                name: "chat.message".to_string(),
+                data: json!({ "text": "see attached" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                attachments: vec![att],
+                metadata: json!({}),
+                expect_ack: true,
+            },
+            EncryptionKind::ChaCha20,
+        );
+
+        let encoded = codec
+            .encode(&packet)
+            .expect("encode encrypted with attachment");
+        let decoded = codec
+            .decode(&encoded)
+            .expect("decode encrypted with attachment");
+
+        let atts = decoded.body.attachments();
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].id, "f2");
+        assert_eq!(atts[0].data, b"hello world");
+    }
+
+    #[test]
     fn encode_rejects_payloads_over_limit() {
-        let codec = FrameCodec::plaintext();
+        // Use a small max to trigger the limit without allocating 100 MiB.
+        let codec = FrameCodec::plaintext().with_max_frame_bytes(1024);
         let packet = PacketEnvelope::new(PacketBody::ApiResponse {
             request_id: 999,
             ok: true,
             status: 200,
-            data: json!({ "blob": "a".repeat(10 * 1024 * 1024) }),
+            data: json!({ "blob": "a".repeat(2048) }),
             error: None,
             metadata: json!({}),
         });
@@ -861,18 +1116,25 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_payloads_over_limit() {
-        let payload = vec![0_u8; MAX_PAYLOAD_BYTES + 1];
-        let frame_len = 2 + payload.len();
-        let mut frame = Vec::with_capacity(4 + frame_len);
-        frame.extend_from_slice(&(frame_len as u32).to_be_bytes());
-        frame.push(MessageType::Api as u8);
-        frame.push(EncryptionKind::None as u8);
-        frame.extend_from_slice(&payload);
+    fn decode_rejects_frames_over_limit() {
+        let codec = FrameCodec::plaintext().with_max_frame_bytes(64);
+        // Build a valid frame that exceeds 64 bytes total.
+        let packet = PacketEnvelope::new(PacketBody::ApiResponse {
+            request_id: 1,
+            ok: true,
+            status: 200,
+            data: json!({ "msg": "a]".repeat(50) }),
+            error: None,
+            metadata: json!({}),
+        });
+        let encoded = FrameCodec::plaintext()
+            .encode(&packet)
+            .expect("encode with default limit");
+        assert!(encoded.len() > 64);
 
-        let error = FrameCodec::plaintext()
-            .decode(&frame)
-            .expect_err("oversized payload should fail");
-        assert!(matches!(error, ProtocolError::PayloadTooLarge { .. }));
+        let error = codec
+            .decode(&encoded)
+            .expect_err("oversized frame should fail");
+        assert!(matches!(error, ProtocolError::FrameTooLarge { .. }));
     }
 }

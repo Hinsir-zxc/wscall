@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 use thiserror::Error;
 use wscall_protocol::{ErrorPayload, FileAttachment, PacketEnvelope, ProtocolError};
 
@@ -38,14 +38,12 @@ pub struct EventMessage {
     pub event_id: u64,
     /// Event name.
     pub name: String,
-    /// Raw JSON event data.
-    pub data: Value,
+    /// Event data object.
+    pub data: Map<String, Value>,
     /// Attachments sent with the event.
     pub attachments: Vec<FileAttachment>,
     /// Raw metadata payload.
     pub metadata: Value,
-    /// Storage ID from a database or other persistent store, when present.
-    pub storage_id: Option<u64>,
 }
 
 /// Errors produced by the reusable WSCALL client.

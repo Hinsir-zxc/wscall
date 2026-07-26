@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and the project follows Semantic Versioning.
 
+## [0.4.0] - 2026-07-27
+
+> **⚠️ BREAKING RELEASE**: This release upgrades the wire protocol to "protocol v2" (binary composite frames) and reworks the on-wire format of event data and attachments. It is **incompatible** with 0.3.0 and earlier: old clients/servers cannot interoperate with 0.4.0 nodes. `wscall`, `wscall-server`, `wscall-client`, and `wscall-protocol` must all be upgraded **together**, and the companion JS SDK must be a `wscall-client-js` build that supports protocol v2. Read the breaking changes below before upgrading.
+
+### Breaking Changes
+
+1. **Protocol v2: binary composite frames** — the frame payload changed from plain JSON text to a composite layout of `meta_len:u32 + JSON bytes + att_count:u8 + raw binary attachment sections`, eliminating Base64 encoding overhead for attachments. The wire format is incompatible with 0.3.0.
+2. **Attachments no longer use the JSON `a` field** — attachments travel as raw binary sections within the frame; the `a` key no longer appears in the JSON envelope. Parameters reference attachments via `{"$file": "<id>"}`.
+3. **Removed the `si` (storage_id) field** — `PacketBody::EventEmit` drops the `storage_id: Option<u64>` field; the `si` key no longer appears in the JSON envelope.
+4. **Event `d` (data) is now strictly a JSON object** — `PacketBody::EventEmit.data` changed from `serde_json::Value` to `Map<String, Value>`: it always serializes as a JSON object and rejects strings and other non-object types on deserialization.
+5. **`m` (metadata) is now optional** — the field is omitted from serialization when metadata is empty (`null` or `{}`).
+6. **Removed persisted-event push APIs** — `ServerHandle::broadcast_persisted_event` and `ServerHandle::send_persisted_event_to` are gone (their capability is folded into `broadcast_event` / `send_event_to`).
+7. **Removed storage_id accessors** — the server-side `EventContext::storage_id()` accessor and the client-side `EventMessage.storage_id` field are removed.
+8. **Event push signatures changed** — the `data` parameter of `ServerHandle::broadcast_event` / `send_event_to` and `WscallClient::send_event` changed from `Value` to `Map<String, Value>`; `EventContext::data()` now returns `&Map<String, Value>`.
+
+### Added
+
+1. `FrameCodec` binary composite-frame codec, built via `plaintext()` / `with_chacha20_key()` / `with_aes256_key()` and `with_max_frame_bytes()`.
+2. `FileAttachment` type (`inline_text` / `inline_bytes` / `param_ref` / `size`) transmitted as raw binary sections.
+3. `MessageType` / `EncryptionKind` enums and the attachment-carrying `PacketEnvelope` / `PacketBody` packet structures.
+4. Dynamic frame size limit: `DEFAULT_MAX_FRAME_BYTES` (default 100 MiB), configurable on the server via `WscallServer::with_max_frame_bytes()`.
+5. Oversized inbound frames now return a 413 error response frame (`request_id=0`, `code="frame_too_large"`) **without closing the connection**, so subsequent requests still work; the integration test `frame_size_limit.rs` covers this behavior.
+
+### Changed
+
+1. The WebSocket-layer `max_message_size` / `max_frame_size` is set to `max_frame_bytes + 1 MiB` of headroom so oversized frames reach the WSCALL-layer check.
+2. Event data `d` is always a JSON object; internal events such as the `system.notice` connection notification now use object payloads.
+
 ## [0.3.0] - 2026-07-26
 
 ### Added

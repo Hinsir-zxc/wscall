@@ -10,7 +10,7 @@ use futures_util::{
     FutureExt, SinkExt, StreamExt,
     future::{BoxFuture, join_all},
 };
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -280,7 +280,7 @@ impl WscallClient {
     pub async fn send_event(
         &self,
         name: impl Into<String>,
-        data: Value,
+        data: Map<String, Value>,
         attachments: Vec<FileAttachment>,
     ) -> Result<Value, ClientError> {
         if !self.is_connected.load(Ordering::SeqCst) {
@@ -299,7 +299,6 @@ impl WscallClient {
                     attachments,
                     metadata: json!({ "client_name": "rust-demo" }),
                     expect_ack: true,
-                    storage_id: None,
                 },
                 self.default_encryption,
             )))
@@ -387,7 +386,6 @@ impl WscallClient {
                 attachments,
                 metadata,
                 expect_ack,
-                storage_id,
             } => {
                 let event = EventMessage {
                     event_id,
@@ -395,7 +393,6 @@ impl WscallClient {
                     data,
                     attachments,
                     metadata,
-                    storage_id,
                 };
                 let handlers = self
                     .event_handlers

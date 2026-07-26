@@ -29,16 +29,22 @@ Each WebSocket binary message is encoded as:
 | frame_len:u32 | message_type:u8 | encryption:u8 | payload |
 ```
 
+In protocol v2 the `payload` is a binary composite frame:
+
+```text
+| meta_len:u32 | JSON envelope bytes | att_count:u8 | [attachment binary sections] |
+```
+
 Transport behavior:
 
-1. Plaintext mode stores JSON directly in `payload`.
+1. Plaintext mode stores the composite frame directly in `payload`.
 2. `ChaCha20` and `AES256` modes store `12-byte nonce + ciphertext` in `payload`.
-3. The payload limit is `10 * 1024 * 1024 - 6`, which keeps the full WSCALL frame within `10 MiB`.
-4. File parameters use JSON references plus inline Base64 attachments.
+3. The whole-frame size limit is configurable via `with_max_frame_bytes` (default `100 MiB`); oversized inbound frames get a `413` (`frame_too_large`) error response without closing the connection.
+4. File parameters use `{"$file": "<id>"}` JSON references; attachment payloads travel as raw binary sections (no Base64 overhead).
 5. The JSON envelope uses compact single-letter keys and a numeric `k` discriminator to minimize per-frame overhead.
 6. `request_id`/`event_id` are per-connection `u64` counters serialized as JSON numbers (1–6 bytes).
 7. `connection_id` uses UUIDv7 (time-ordered, generated once per connection).
-8. Events may carry an optional `si` (Storage ID) field for server-pushed persisted messages.
+8. Event `data` (`d`) is always a JSON object; `metadata` (`m`) is optional and omitted when empty.
 
 ### Key Agreement Modes
 
@@ -60,15 +66,15 @@ Depend on only what you need:
 
 ```toml
 [dependencies]
-wscall-server = "0.2.0"
-wscall-client = "0.2.0"
+wscall-server = "0.4.0"
+wscall-client = "0.4.0"
 ```
 
 Or use the facade crate:
 
 ```toml
 [dependencies]
-wscall = { version = "0.2.0", features = ["full"] }
+wscall = { version = "0.4.0", features = ["full"] }
 ```
 
 ## Quick Start

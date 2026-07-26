@@ -24,6 +24,6 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true
-wscall-protocol = { path = "../wscall-protocol", version = "0.3.0" }
+wscall-protocol = { path = "../wscall-protocol", version = "0.4.0" }
 x25519-dalek.workspace = true
 sha2.workspace = true
