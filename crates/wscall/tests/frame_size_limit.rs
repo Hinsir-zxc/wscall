@@ -72,7 +72,7 @@ async fn oversized_frame_returns_413_and_keeps_connection_open() {
     // 1) Send an oversized binary frame (larger than max_frame_bytes, well
     //    within the WebSocket-level headroom) and expect a 413 error response.
     let oversized = vec![0u8; max_frame_bytes + 100];
-    ws.send(Message::Binary(oversized))
+    ws.send(Message::Binary(oversized.into()))
         .await
         .expect("send oversized");
 
@@ -108,7 +108,7 @@ async fn oversized_frame_returns_413_and_keeps_connection_open() {
         EncryptionKind::None,
     );
     ws.send(Message::Binary(
-        codec.encode(&request).expect("encode request"),
+        codec.encode(&request).expect("encode request").into(),
     ))
     .await
     .expect("send normal request after 413");

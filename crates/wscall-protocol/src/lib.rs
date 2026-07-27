@@ -472,68 +472,77 @@ impl Serialize for PacketBody {
     }
 }
 
-// --- Manual Deserialize: read numeric `k`, dispatch to short-key fields -------
+// --- Manual Deserialize: read numeric `k`, move fields out directly ----------
+//
+// The body is parsed into a JSON object map exactly once; each variant then
+// *moves* its fields out of that map. Nested payloads such as `params`, `data`,
+// `metadata` and `receipt` are transferred without a second traversal, unlike
+// the previous `Value::deserialize` + `serde_json::from_value` pair which walked
+// the whole tree twice.
 
-/// Deserialization helper for [`PacketBody::ApiRequest`].
-#[derive(Deserialize)]
-struct ApiRequestFields {
-    #[serde(rename = "i")]
-    request_id: u64,
-    #[serde(rename = "r")]
-    route: String,
-    #[serde(rename = "p", default)]
-    params: Value,
-    #[serde(rename = "a", default)]
-    attachments: Vec<FileAttachment>,
-    #[serde(rename = "m", default)]
-    metadata: Value,
+/// Moves a required unsigned integer field out of the map.
+fn take_u64<E: serde::de::Error>(map: &mut Map<String, Value>, key: &str) -> Result<u64, E> {
+    map.remove(key).and_then(|v| v.as_u64()).ok_or_else(|| {
+        E::custom(format!(
+            "missing or non-numeric '{key}' field in packet body"
+        ))
+    })
 }
 
-/// Deserialization helper for [`PacketBody::ApiResponse`].
-#[derive(Deserialize)]
-struct ApiResponseFields {
-    #[serde(rename = "i")]
-    request_id: u64,
-    #[serde(rename = "o", default)]
-    ok: bool,
-    #[serde(rename = "s", default)]
-    status: u16,
-    #[serde(rename = "d", default)]
-    data: Value,
-    #[serde(rename = "er", default)]
-    error: Option<ErrorPayload>,
-    #[serde(rename = "m", default)]
-    metadata: Value,
+/// Moves a required string field out of the map.
+fn take_string<E: serde::de::Error>(map: &mut Map<String, Value>, key: &str) -> Result<String, E> {
+    match map.remove(key) {
+        Some(Value::String(s)) => Ok(s),
+        _ => Err(E::custom(format!(
+            "missing or non-string '{key}' field in packet body"
+        ))),
+    }
 }
 
-/// Deserialization helper for [`PacketBody::EventEmit`].
-#[derive(Deserialize)]
-struct EventEmitFields {
-    #[serde(rename = "i")]
-    event_id: u64,
-    #[serde(rename = "n")]
-    name: String,
-    #[serde(rename = "d", default)]
-    data: Map<String, Value>,
-    #[serde(rename = "a", default)]
-    attachments: Vec<FileAttachment>,
-    #[serde(rename = "m", default)]
-    metadata: Value,
-    #[serde(rename = "e", default)]
-    expect_ack: bool,
+/// Moves an optional JSON object field, defaulting to an empty map.
+fn take_object<E: serde::de::Error>(
+    map: &mut Map<String, Value>,
+    key: &str,
+) -> Result<Map<String, Value>, E> {
+    match map.remove(key) {
+        None => Ok(Map::new()),
+        Some(Value::Object(o)) => Ok(o),
+        Some(_) => Err(E::custom(format!("'{key}' field must be a JSON object"))),
+    }
 }
 
-/// Deserialization helper for [`PacketBody::EventAck`].
-#[derive(Deserialize)]
-struct EventAckFields {
-    #[serde(rename = "i")]
-    event_id: u64,
-    #[serde(rename = "o", default)]
-    ok: bool,
-    #[serde(rename = "rc", default)]
-    receipt: Value,
-    #[serde(rename = "er", default)]
-    error: Option<ErrorPayload>,
+/// Moves an optional boolean field, defaulting to `false`.
+fn take_bool(map: &mut Map<String, Value>, key: &str) -> bool {
+    map.remove(key).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// Moves an optional `u16` field, defaulting to `0`.
+fn take_u16(map: &mut Map<String, Value>, key: &str) -> u16 {
+    map.remove(key).and_then(|v| v.as_u64()).unwrap_or(0) as u16
+}
+
+/// Moves the optional binary-attachment reference list (`a`).
+///
+/// Attachments normally travel in the frame's binary section and are injected
+/// via [`PacketBody::set_attachments`]; the JSON `a` field is only honoured for
+/// completeness and is almost always absent.
+fn take_attachments<E: serde::de::Error>(
+    map: &mut Map<String, Value>,
+) -> Result<Vec<FileAttachment>, E> {
+    match map.remove("a") {
+        None => Ok(Vec::new()),
+        Some(value) => serde_json::from_value(value).map_err(E::custom),
+    }
+}
+
+/// Moves the optional error payload (`er`).
+fn take_error<E: serde::de::Error>(
+    map: &mut Map<String, Value>,
+) -> Result<Option<ErrorPayload>, E> {
+    match map.remove("er") {
+        None => Ok(None),
+        Some(value) => serde_json::from_value(value).map(Some).map_err(E::custom),
+    }
 }
 
 impl<'de> Deserialize<'de> for PacketBody {
@@ -541,10 +550,18 @@ impl<'de> Deserialize<'de> for PacketBody {
     where
         D: Deserializer<'de>,
     {
-        // Parse into a generic JSON value first so we can inspect the numeric
-        // `k` discriminator, then dispatch to the appropriate short-key struct.
-        let value = Value::deserialize(deserializer)?;
-        let k = value.get("k").and_then(|v| v.as_u64()).ok_or_else(|| {
+        // Parse into a JSON object map once so we can inspect the numeric `k`
+        // discriminator, then move the remaining fields out by short key.
+        let mut map = match Value::deserialize(deserializer)? {
+            Value::Object(map) => map,
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "packet body must be a JSON object",
+                ));
+            }
+        };
+
+        let k = map.get("k").and_then(|v| v.as_u64()).ok_or_else(|| {
             serde::de::Error::custom("missing or non-numeric 'k' field in packet body")
         })?;
         let k = u8::try_from(k).map_err(|_| {
@@ -552,51 +569,35 @@ impl<'de> Deserialize<'de> for PacketBody {
         })?;
 
         match k {
-            K_API_REQUEST => {
-                let f = serde_json::from_value::<ApiRequestFields>(value)
-                    .map_err(serde::de::Error::custom)?;
-                Ok(Self::ApiRequest {
-                    request_id: f.request_id,
-                    route: f.route,
-                    params: f.params,
-                    attachments: f.attachments,
-                    metadata: f.metadata,
-                })
-            }
-            K_EVENT_EMIT => {
-                let f = serde_json::from_value::<EventEmitFields>(value)
-                    .map_err(serde::de::Error::custom)?;
-                Ok(Self::EventEmit {
-                    event_id: f.event_id,
-                    name: f.name,
-                    data: f.data,
-                    attachments: f.attachments,
-                    metadata: f.metadata,
-                    expect_ack: f.expect_ack,
-                })
-            }
-            K_API_RESPONSE => {
-                let f = serde_json::from_value::<ApiResponseFields>(value)
-                    .map_err(serde::de::Error::custom)?;
-                Ok(Self::ApiResponse {
-                    request_id: f.request_id,
-                    ok: f.ok,
-                    status: f.status,
-                    data: f.data,
-                    error: f.error,
-                    metadata: f.metadata,
-                })
-            }
-            K_EVENT_ACK => {
-                let f = serde_json::from_value::<EventAckFields>(value)
-                    .map_err(serde::de::Error::custom)?;
-                Ok(Self::EventAck {
-                    event_id: f.event_id,
-                    ok: f.ok,
-                    receipt: f.receipt,
-                    error: f.error,
-                })
-            }
+            K_API_REQUEST => Ok(Self::ApiRequest {
+                request_id: take_u64(&mut map, "i")?,
+                route: take_string(&mut map, "r")?,
+                params: map.remove("p").unwrap_or(Value::Null),
+                attachments: take_attachments(&mut map)?,
+                metadata: map.remove("m").unwrap_or(Value::Null),
+            }),
+            K_EVENT_EMIT => Ok(Self::EventEmit {
+                event_id: take_u64(&mut map, "i")?,
+                name: take_string(&mut map, "n")?,
+                data: take_object(&mut map, "d")?,
+                attachments: take_attachments(&mut map)?,
+                metadata: map.remove("m").unwrap_or(Value::Null),
+                expect_ack: take_bool(&mut map, "e"),
+            }),
+            K_API_RESPONSE => Ok(Self::ApiResponse {
+                request_id: take_u64(&mut map, "i")?,
+                ok: take_bool(&mut map, "o"),
+                status: take_u16(&mut map, "s"),
+                data: map.remove("d").unwrap_or(Value::Null),
+                error: take_error(&mut map)?,
+                metadata: map.remove("m").unwrap_or(Value::Null),
+            }),
+            K_EVENT_ACK => Ok(Self::EventAck {
+                event_id: take_u64(&mut map, "i")?,
+                ok: take_bool(&mut map, "o"),
+                receipt: map.remove("rc").unwrap_or(Value::Null),
+                error: take_error(&mut map)?,
+            }),
             _ => Err(serde::de::Error::custom(format!("unknown 'k' value: {k}"))),
         }
     }
@@ -749,19 +750,50 @@ impl FrameCodec {
     /// ```
     pub fn encode(&self, packet: &PacketEnvelope) -> Result<Vec<u8>, ProtocolError> {
         let max_payload = self.max_frame_bytes.saturating_sub(6);
-
-        // Serialize JSON metadata (attachments excluded from JSON).
-        let json_bytes = serde_json::to_vec(&packet.body)?;
-
-        // Collect attachments from the packet body.
         let attachments = packet.body.attachments();
+        let att_size: usize = attachments.iter().map(|a| a.wire_size()).sum();
+        let message_type = packet.message_type as u8;
+        let encryption = packet.encryption as u8;
 
-        // Build the composite payload.
-        let mut composite = Vec::with_capacity(
-            4 + json_bytes.len() + 1 + attachments.iter().map(|a| a.wire_size()).sum::<usize>(),
-        );
-        composite.extend_from_slice(&(json_bytes.len() as u32).to_be_bytes());
-        composite.extend_from_slice(&json_bytes);
+        // Plaintext fast path: build the final frame in a single buffer with no
+        // intermediate copies. The JSON metadata is written directly into the
+        // frame via `to_writer` (no temporary `json_bytes` Vec), and the
+        // `frame_len` / `meta_len` prefixes are patched in place once known.
+        //
+        // Layout: frame_len:u32 | msg_type:u8 | enc:u8 | meta_len:u32 | json | att_count:u8 | [atts]
+        if packet.encryption == EncryptionKind::None {
+            let mut frame = Vec::with_capacity(4 + 2 + 4 + 1 + att_size + 64);
+            frame.extend_from_slice(&[0u8; 4]); // frame_len placeholder
+            frame.push(message_type);
+            frame.push(encryption);
+            frame.extend_from_slice(&[0u8; 4]); // meta_len placeholder
+            serde_json::to_writer(&mut frame, &packet.body)?;
+            let json_len = frame.len() - 10;
+            frame.push(attachments.len() as u8);
+            for att in attachments {
+                att.write_wire(&mut frame);
+            }
+            let payload_len = frame.len() - 6;
+            if payload_len > max_payload {
+                return Err(ProtocolError::PayloadTooLarge {
+                    actual: payload_len,
+                    max: max_payload,
+                });
+            }
+            let frame_len = (frame.len() - 4) as u32;
+            frame[0..4].copy_from_slice(&frame_len.to_be_bytes());
+            frame[6..10].copy_from_slice(&(json_len as u32).to_be_bytes());
+            return Ok(frame);
+        }
+
+        // Encrypted path: build the composite payload (meta_len | json |
+        // att_count | atts) writing JSON directly, encrypt it, then wrap with
+        // the frame header.
+        let mut composite = Vec::with_capacity(4 + 1 + att_size + 64);
+        composite.extend_from_slice(&[0u8; 4]); // meta_len placeholder
+        serde_json::to_writer(&mut composite, &packet.body)?;
+        let json_len = composite.len() - 4;
+        composite[0..4].copy_from_slice(&(json_len as u32).to_be_bytes());
         composite.push(attachments.len() as u8);
         for att in attachments {
             att.write_wire(&mut composite);
@@ -776,9 +808,9 @@ impl FrameCodec {
         }
 
         let payload = match packet.encryption {
-            EncryptionKind::None => composite,
             EncryptionKind::ChaCha20 => self.encrypt_chacha20(&composite)?,
             EncryptionKind::Aes256 => self.encrypt_aes256(&composite)?,
+            EncryptionKind::None => unreachable!("plaintext is handled by the fast path above"),
         };
 
         // Post-encryption size check (nonce + tag add overhead).
@@ -792,8 +824,8 @@ impl FrameCodec {
         let frame_len = 2 + payload.len();
         let mut frame = Vec::with_capacity(4 + frame_len);
         frame.extend_from_slice(&(frame_len as u32).to_be_bytes());
-        frame.push(packet.message_type as u8);
-        frame.push(packet.encryption as u8);
+        frame.push(message_type);
+        frame.push(encryption);
         frame.extend_from_slice(&payload);
         Ok(frame)
     }

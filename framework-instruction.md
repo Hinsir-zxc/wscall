@@ -232,6 +232,8 @@ server.listen("127.0.0.1:9001").await?;
 - **无锁连接表**：`DashMap` 替代单一 `RwLock<HashMap>`，读路径无锁，广播可并发遍历。
 - **连接数上限**：`with_max_connections(n)` 在 accept 前获取许可，连接洪泛转为背压而非无界 spawn。
 - **低延迟**：accept 后设置 `TCP_NODELAY`，关闭 Nagle 以降低小帧 RPC 延迟。
+- **零拷贝类型化路由**：`typed_route` / `validated_route` 通过 `mem::take` 将 params 从上下文**移出**后 `from_value`，避免每请求深拷贝整棵 params JSON 树；公共 `bind` / `bind_and_validate` / `bind_validated` 行为不变。
+- **生命周期 handler 并发**：`on_connected` / `on_disconnected` 以 `join_all` 并发执行，慢 handler 不再延迟连接建立与拆除。
 - **日志**：库内使用 `tracing`，热路径不再竞争 stdout 锁；ACK 等高频消息默认 `debug` 级。
 
 ---
@@ -282,6 +284,9 @@ WscallClient::connect_with_ecdh(url).await?;
 - **无锁 pending 表**：`pending_api`/`pending_event` 改为 `DashMap`，消除单 `Mutex` 对所有并发调用的串行化；响应分发与超时清理均无锁。
 - **无锁出站句柄**：`writer` 字段使用 `arc_swap::ArcSwapOption`，`send_outbound` 读取无锁、无 `Option` 克隆。
 - **事件 handler 并发**：服务端推送事件的多 handler 并发执行，慢 handler 不再阻塞读循环。
+- **EventEmit 派发 spawn 化**：入站事件在独立任务处理，读循环不被慢 handler 队头阻塞；API 响应 / 事件 ACK 保持内联分发。
+- **静态 metadata**：出站请求/事件的 metadata 由 `OnceLock` 构造一次后克隆复用，消除每调用重复构造 JSON 对象。
+- **重连抖动随机源**：重连抖动改用 `getrandom` 操作系统随机源（替代时钟纳秒），避免同刻重连客户端抖动相关。
 - **日志**：库内使用 `tracing`，不阻塞事件循环。
 
 ### 5.5 错误类型
@@ -315,6 +320,8 @@ WscallClient::connect_with_ecdh(url).await?;
 
 - **加密器预计算缓存**：`ChaCha20Poly1305` / `Aes256Gcm` 在配置密钥时构造一次，以 `Arc` 在 codec 所有克隆间共享，编解码不再每帧重复密钥调度（AES-256 密钥扩展尤其受益）。
 - **明文解码零多余拷贝**：明文路径以 `Cow::Borrowed` 直接借用帧切片，跳过 `to_vec`。
+- **单缓冲编码**：`encode` 明文路径直接构建最终帧（`serde_json::to_writer` 直写 + 原地回填长度前缀），去除中间 JSON 缓冲与多次全缓冲拷贝；加密路径同样去除中间 JSON 缓冲。
+- **单次解析反序列化**：`PacketBody::deserialize` 仅解析一次 JSON 对象后直接 move 字段，嵌套 `params`/`data`/`metadata`/`receipt` 不再二次遍历。
 - **加密前预检大小**：先校验 JSON 序列化结果再加密，避免对超限负载做无谓加密后丢弃。
 
 ---

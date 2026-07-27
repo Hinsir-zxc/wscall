@@ -67,7 +67,8 @@ async fn run_test_protocol_server(
                         EncryptionKind::None,
                     );
 
-                    sink.send(Message::Binary(codec.encode(&response)?)).await?;
+                    sink.send(Message::Binary(codec.encode(&response)?.into()))
+                        .await?;
 
                     if close_after_response {
                         let _ = sink.send(Message::Close(None)).await;

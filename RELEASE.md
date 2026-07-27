@@ -7,9 +7,9 @@ This workspace publishes a crate family with dependency ordering:
 3. `wscall-client`
 4. `wscall`
 
-Current target release: `0.4.0`
+Current target release: `0.4.1`
 
-> **⚠️ BREAKING RELEASE**: `0.4.0` upgrades the wire protocol to "protocol v2" (binary composite frames), removes the `si` field, and tightens event `d` to a JSON object. It is incompatible with `0.3.0` and earlier. Release notes (GitHub Release / crates.io version notes) must be clearly labeled BREAKING and remind users to upgrade all four crates together and to use a `wscall-client-js` build that supports protocol v2. See the `[0.4.0]` entry in `CHANGELOG.md` for details.
+> **✅ NON-BREAKING RELEASE**: `0.4.1` is a performance-only patch release. It changes no public API and no wire format, and is fully interoperable with `0.4.0`. The only manifest change is a new `getrandom` dependency in `wscall-client`. See the `[0.4.1]` entry in `CHANGELOG.md` for details. The previous `0.4.0` release was the BREAKING protocol-v2 upgrade; nodes still on `0.3.0` or earlier must upgrade to `0.4.x` (all four crates together) and use a protocol-v2 `wscall-client-js` build.
 
 ## Pre-release checks
 
@@ -72,7 +72,7 @@ cargo publish -p wscall
 Run through this list before the first `cargo publish`:
 
 1. Working tree is clean or intentionally dirty for a local dry run.
-2. Workspace version is set to `0.4.0` and internal crate dependency pins also use `0.4.0`.
+2. Workspace version is set to `0.4.1` and internal crate dependency pins also use `0.4.1`.
 3. `CHANGELOG.md` includes the target version notes.
 4. `README.md` quick-start commands still work.
 5. Workspace quality gates pass.

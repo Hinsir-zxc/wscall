@@ -8,7 +8,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"
@@ -33,6 +33,6 @@ thiserror = "2.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 tokio = { version = "1.45", features = ["full"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.30"
 uuid = { version = "1.18", features = ["serde", "v4", "v7"] }
 validator = { version = "0.20", features = ["derive"] }

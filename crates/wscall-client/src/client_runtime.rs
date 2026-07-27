@@ -1,8 +1,9 @@
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
 use dashmap::DashMap;
@@ -39,6 +40,18 @@ const CLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const CLIENT_OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const CLIENT_RECONNECT_BASE_DELAY_SECS: u64 = 3;
 const CLIENT_RECONNECT_MAX_DELAY_SECS: u64 = 30;
+
+/// Metadata attached to every outbound request/event.
+///
+/// The JSON object is constructed once and cloned thereafter, avoiding the
+/// repeated map + string allocations that rebuilding `json!({...})` on every
+/// `call`/`send_event` would incur.
+fn client_metadata() -> Value {
+    static METADATA: OnceLock<Value> = OnceLock::new();
+    METADATA
+        .get_or_init(|| json!({ "client_name": "rust-demo" }))
+        .clone()
+}
 
 #[derive(Clone)]
 pub struct WscallClient {
@@ -257,7 +270,7 @@ impl WscallClient {
                     route,
                     params,
                     attachments,
-                    metadata: json!({ "client_name": "rust-demo" }),
+                    metadata: client_metadata(),
                 },
                 self.default_encryption,
             )))
@@ -297,7 +310,7 @@ impl WscallClient {
                     name: name.into(),
                     data,
                     attachments,
-                    metadata: json!({ "client_name": "rust-demo" }),
+                    metadata: client_metadata(),
                     expect_ack: true,
                 },
                 self.default_encryption,
@@ -492,7 +505,7 @@ impl WscallClient {
 
             // Send the client's 32-byte public key as a raw binary message.
             socket
-                .send(Message::Binary(keypair.public_bytes().to_vec()))
+                .send(Message::Binary(keypair.public_bytes().to_vec().into()))
                 .await
                 .map_err(|e| ClientError::ConnectionClosed(e.to_string()))?;
 
@@ -541,17 +554,17 @@ impl WscallClient {
                             }
                         };
 
-                        if let Err(error) = sink.send(Message::Binary(encoded)).await {
+                        if let Err(error) = sink.send(Message::Binary(encoded.into())).await {
                             break ClientError::ConnectionClosed(error.to_string());
                         }
                     }
                     ClientOutbound::Ping(payload) => {
-                        if let Err(error) = sink.send(Message::Ping(payload)).await {
+                        if let Err(error) = sink.send(Message::Ping(payload.into())).await {
                             break ClientError::ConnectionClosed(error.to_string());
                         }
                     }
                     ClientOutbound::Pong(payload) => {
-                        if let Err(error) = sink.send(Message::Pong(payload)).await {
+                        if let Err(error) = sink.send(Message::Pong(payload.into())).await {
                             break ClientError::ConnectionClosed(error.to_string());
                         }
                     }
@@ -613,7 +626,24 @@ impl WscallClient {
 
                 match message {
                     Ok(Message::Binary(bytes)) => match reader_codec.decode(&bytes) {
-                        Ok(packet) => reader_client.handle_packet(packet).await,
+                        Ok(packet) => {
+                            if matches!(packet.body, PacketBody::EventEmit { .. }) {
+                                // Event handlers may be slow and must compute an
+                                // ack receipt, so run them on a dedicated task.
+                                // This keeps the reader free to dispatch subsequent
+                                // inbound frames (notably API responses) without
+                                // head-of-line blocking, mirroring the server's
+                                // spawn-per-request design.
+                                let client = reader_client.clone();
+                                tokio::spawn(async move {
+                                    client.handle_packet(packet).await;
+                                });
+                            } else {
+                                // API responses / event acks are trivial channel
+                                // dispatches; handle them inline.
+                                reader_client.handle_packet(packet).await;
+                            }
+                        }
                         Err(error) => tracing::warn!(%error, "failed to decode inbound frame"),
                     },
                     Ok(Message::Close(_)) => {
@@ -736,10 +766,15 @@ impl WscallClient {
     /// Random sub-second jitter in `[0, base/2)` to de-synchronize reconnecting
     /// clients and avoid thundering-herd spikes against a recovering server.
     fn reconnect_jitter() -> Duration {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.subsec_nanos() as u64)
-            .unwrap_or(0);
+        // OS-provided randomness keeps the jitter uncorrelated across clients;
+        // the previous wall-clock nanosecond source could collide for clients
+        // reconnecting in the same instant. Falls back to zero jitter (still
+        // correct, just synchronized) if the entropy source ever fails.
+        let mut buf = [0u8; 4];
+        let nanos = match getrandom::getrandom(&mut buf) {
+            Ok(()) => u32::from_le_bytes(buf) as u64,
+            Err(_) => 0,
+        };
         let max_nanos = (CLIENT_RECONNECT_BASE_DELAY_SECS * 1_000_000_000) / 2;
         Duration::from_nanos(nanos % max_nanos.max(1))
     }

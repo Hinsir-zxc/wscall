@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and the project follows Semantic Versioning.
 
+## [0.4.1] - 2026-07-26
+
+A non-breaking performance release. Fully compatible with `0.4.0` — no public API or wire-protocol changes; the four crates interoperate with `0.4.0` nodes and can be upgraded independently. The companion `wscall-client-js` received matching codec optimizations in its own repository.
+
+### Changed
+
+1. **Protocol single-pass deserialization** — `PacketBody::deserialize` parses the JSON object once and moves fields out directly, removing the previous `Value::deserialize` + `serde_json::from_value` double traversal of nested `params` / `data` / `metadata` / `receipt` trees.
+2. **Protocol single-buffer frame encoding** — the plaintext path builds the final frame in one buffer (`serde_json::to_writer` straight into the frame with in-place length backpatching), eliminating the intermediate JSON buffer and repeated full-buffer copies; the encrypted path drops the intermediate JSON buffer as well.
+3. **Zero-copy typed routes** — `typed_route` / `validated_route` now bind params by moving the `Value` out of the context (`mem::take`) instead of deep-cloning the whole params tree on every request. Public `bind` / `bind_and_validate` / `bind_validated` are unchanged.
+4. **Concurrent server lifecycle handlers** — `on_connected` / `on_disconnected` handlers now run concurrently via `join_all`, so a slow handler no longer delays connection establishment or teardown.
+5. **Stronger reconnect jitter** — client reconnect jitter now uses OS randomness (`getrandom`) instead of wall-clock nanoseconds, de-correlating clients that reconnect in the same instant.
+6. **Spawned client event dispatch** — inbound `EventEmit` packets are handled in a dedicated task so a slow event handler cannot block the read loop; API responses / event acks stay inline.
+7. **Static client metadata** — outbound request/event metadata is built once behind a `OnceLock` and cloned thereafter, avoiding repeated JSON object construction per call.
+
+### Added
+
+1. `wscall-client` now depends on `getrandom` (workspace dependency) for reconnect jitter randomness.
+
 ## [0.4.0] - 2026-07-27
 
 > **⚠️ BREAKING RELEASE**: This release upgrades the wire protocol to "protocol v2" (binary composite frames) and reworks the on-wire format of event data and attachments. It is **incompatible** with 0.3.0 and earlier: old clients/servers cannot interoperate with 0.4.0 nodes. `wscall`, `wscall-server`, `wscall-client`, and `wscall-protocol` must all be upgraded **together**, and the companion JS SDK must be a `wscall-client-js` build that supports protocol v2. Read the breaking changes below before upgrading.

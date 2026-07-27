@@ -207,6 +207,22 @@ impl ApiContext {
             .map_err(|source| ApiError::bad_request(format!("invalid params: {source}")))
     }
 
+    /// Moves the params payload out and binds it without cloning.
+    ///
+    /// `serde_json::from_value` consumes its input, so taking ownership of the
+    /// stored `Value` first avoids the deep copy that [`Self::bind`] performs.
+    /// The stored params are replaced with `Value::Null`; this is intended for
+    /// the `typed_route` / `validated_route` wrappers whose handlers receive the
+    /// typed value directly and no longer need the raw params.
+    pub(crate) fn bind_take<T>(&mut self) -> Result<T, ApiError>
+    where
+        T: DeserializeOwned,
+    {
+        let params = std::mem::take(&mut self.params);
+        serde_json::from_value(params)
+            .map_err(|source| ApiError::bad_request(format!("invalid params: {source}")))
+    }
+
     /// Binds params and runs `ValidateParams` on the result.
     pub fn bind_and_validate<T>(&self) -> Result<T, ApiError>
     where

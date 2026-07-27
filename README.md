@@ -66,15 +66,15 @@ Depend on only what you need:
 
 ```toml
 [dependencies]
-wscall-server = "0.4.0"
-wscall-client = "0.4.0"
+wscall-server = "0.4.1"
+wscall-client = "0.4.1"
 ```
 
 Or use the facade crate:
 
 ```toml
 [dependencies]
-wscall = { version = "0.4.0", features = ["full"] }
+wscall = { version = "0.4.1", features = ["full"] }
 ```
 
 ## Quick Start
@@ -203,6 +203,9 @@ The demos exercise:
 6. **Compact wire format**: single-letter JSON keys + numeric `k` tag + `u64` counters for IDs minimize per-frame byte overhead.
 7. **Low latency**: `TCP_NODELAY` on accept, `tracing` instead of `println!` on hot paths.
 8. **Forward secrecy via ECDH**: each connection negotiates a unique X25519 session key; reconnects generate fresh keys automatically.
+9. **Zero-copy typed routing**: `typed_route` / `validated_route` move params out of the context instead of deep-cloning the JSON tree per request.
+10. **Single-buffer codec**: frames are encoded in a single buffer and decoded in a single JSON pass, minimizing per-frame allocations and copies.
+11. **Concurrent lifecycle hooks**: server `on_connected` / `on_disconnected` handlers run concurrently and never delay connection setup.
 
 See `framework-instruction.md` for the full architecture and performance model documentation.
 

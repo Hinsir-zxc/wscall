@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_util::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
+use futures_util::{FutureExt, SinkExt, StreamExt, future::BoxFuture, future::join_all};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use tokio::net::{TcpListener, TcpStream};
@@ -27,6 +27,7 @@ use crate::server_types::{
     ApiContext, ApiError, ClientEntry, EventContext, ExceptionContext, ServerConnectionContext,
     ServerDisconnectContext, ServerError, ServerHandle, ServerOutbound, ServerState,
 };
+use crate::validation;
 
 const SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const SERVER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -310,9 +311,11 @@ impl WscallServer {
         Fut: Future<Output = Result<Value, ApiError>> + Send + 'static,
     {
         let handler = Arc::new(handler);
-        self.route(route, move |ctx| {
+        self.route(route, move |mut ctx| {
             let handler = Arc::clone(&handler);
-            let params = ctx.bind::<T>();
+            // Zero-copy bind: moves the params out of the context instead of
+            // deep-cloning the whole JSON tree on every request.
+            let params = ctx.bind_take::<T>();
             async move {
                 let params = params?;
                 handler(ctx, params).await
@@ -327,9 +330,18 @@ impl WscallServer {
         Fut: Future<Output = Result<Value, ApiError>> + Send + 'static,
     {
         let handler = Arc::new(handler);
-        self.route(route, move |ctx| {
+        self.route(route, move |mut ctx| {
             let handler = Arc::clone(&handler);
-            let params = ctx.bind_validated::<T>();
+            // Zero-copy bind (see `typed_route`); validation runs on the owned
+            // value exactly as before.
+            let params: Result<T, ApiError> = ctx.bind_take::<T>().and_then(|params: T| {
+                params.validate().map_err(|source| {
+                    ApiError::bad_request("params validation failed").with_details(json!({
+                        "validation_errors": validation::errors_to_details(&source),
+                    }))
+                })?;
+                Ok(params)
+            });
             async move {
                 let params = params?;
                 handler(ctx, params).await
@@ -434,11 +446,9 @@ impl WscallServer {
         // Configure WebSocket-level message size limit slightly above the
         // WSCALL limit so that oversized frames can still be received and
         // answered with a 413 error response instead of an abrupt close.
-        let ws_config = WebSocketConfig {
-            max_message_size: Some(self.max_frame_bytes + 1024 * 1024),
-            max_frame_size: Some(self.max_frame_bytes + 1024 * 1024),
-            ..Default::default()
-        };
+        let mut ws_config = WebSocketConfig::default();
+        ws_config.max_message_size = Some(self.max_frame_bytes + 1024 * 1024);
+        ws_config.max_frame_size = Some(self.max_frame_bytes + 1024 * 1024);
         let mut websocket = accept_async_with_config(stream, Some(ws_config)).await?;
         let connection_id = Uuid::now_v7().to_string();
         let peer_addr = Some(peer);
@@ -478,14 +488,18 @@ impl WscallServer {
                         };
                         match outbound {
                             ServerOutbound::PreEncoded(bytes) => {
-                                sink.send(Message::Binary(bytes.to_vec())).await?;
+                                // Zero-copy: `bytes` is already a shared `Bytes`,
+                                // and tungstenite 0.30 accepts `Bytes` directly, so
+                                // broadcasts encoded once are shipped to every
+                                // recipient without a per-recipient frame copy.
+                                sink.send(Message::Binary(bytes)).await?;
                             }
                             ServerOutbound::Packet(packet) => {
                                 let encoded = writer_codec.encode(&packet)?;
-                                sink.send(Message::Binary(encoded)).await?;
+                                sink.send(Message::Binary(encoded.into())).await?;
                             }
                             ServerOutbound::Pong(payload) => {
-                                sink.send(Message::Pong(payload)).await?;
+                                sink.send(Message::Pong(payload.into())).await?;
                             }
                             ServerOutbound::Close => {
                                 let _ = sink.send(Message::Close(None)).await;
@@ -494,7 +508,7 @@ impl WscallServer {
                         }
                     }
                     _ = ticker.tick() => {
-                        if let Err(error) = sink.send(Message::Ping(Vec::new())).await {
+                        if let Err(error) = sink.send(Message::Ping(Bytes::new())).await {
                             break Err(ServerError::WebSocket(error));
                         }
                     }
@@ -654,7 +668,7 @@ impl WscallServer {
 
         // 3. Send the server's public key.
         websocket
-            .send(Message::Binary(keypair.public_bytes().to_vec()))
+            .send(Message::Binary(keypair.public_bytes().to_vec().into()))
             .await?;
 
         // 4. Derive the session key and build the per-connection codec.
@@ -974,18 +988,18 @@ impl WscallServer {
 
     async fn notify_connected(&self, connection_id: &str, peer_addr: Option<std::net::SocketAddr>) {
         let handlers = self.connection_handlers.clone();
-        for handler in handlers {
+        // Run lifecycle handlers concurrently so a slow handler cannot delay
+        // connection establishment (the reader loop starts right after this).
+        let futures = handlers.into_iter().map(|handler| {
             let context = ServerConnectionContext {
                 connection_id: connection_id.to_string(),
                 peer_addr,
                 server: self.handle(),
             };
-
-            if AssertUnwindSafe(handler(context))
-                .catch_unwind()
-                .await
-                .is_err()
-            {
+            AssertUnwindSafe(handler(context)).catch_unwind()
+        });
+        for result in join_all(futures).await {
+            if result.is_err() {
                 tracing::error!("server connected handler panicked");
             }
         }
@@ -998,19 +1012,17 @@ impl WscallServer {
         reason: String,
     ) {
         let handlers = self.disconnect_handlers.clone();
-        for handler in handlers {
+        let futures = handlers.into_iter().map(|handler| {
             let context = ServerDisconnectContext {
                 connection_id: connection_id.to_string(),
                 peer_addr,
                 reason: reason.clone(),
                 server: self.handle(),
             };
-
-            if AssertUnwindSafe(handler(context))
-                .catch_unwind()
-                .await
-                .is_err()
-            {
+            AssertUnwindSafe(handler(context)).catch_unwind()
+        });
+        for result in join_all(futures).await {
+            if result.is_err() {
                 tracing::error!("server disconnected handler panicked");
             }
         }

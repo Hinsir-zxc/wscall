@@ -19,11 +19,12 @@ all-features = true
 arc-swap.workspace = true
 dashmap.workspace = true
 futures-util.workspace = true
+getrandom.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true
-wscall-protocol = { path = "../wscall-protocol", version = "0.4.0" }
+wscall-protocol = { path = "../wscall-protocol", version = "0.4.1" }
 x25519-dalek.workspace = true
 sha2.workspace = true
