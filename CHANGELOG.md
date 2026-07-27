@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and the project follows Semantic Versioning.
 
+## [0.5.1] - 2026-07-26
+
+> **Protocol v3** (wire-format change): the per-frame `encryption` byte has been removed from the frame header. Encryption mode is now a connection-level property determined at connection setup (PSK config or ECDH handshake). Frame header shrinks from 6 bytes to 5 bytes (`frame_len:u32 | message_type:u8`). **0.5.1 nodes cannot interoperate with ≤0.5.0 nodes at the wire level.** The Rust public API signatures are unchanged.
+
+### Changed
+
+1. **Frame header reduced to 5 bytes** — removed the `encryption:u8` byte; the frame layout is now `frame_len:u32 | message_type:u8 | payload`. Every frame saves 1 byte of fixed overhead.
+2. **`FrameCodec` gains `wire_encryption` field** — the connection-level encryption mode is stored in the codec instance. `with_chacha20_key()` / `with_aes256_key()` automatically set it. `encode()` and `decode()` use `self.wire_encryption` instead of a per-frame byte.
+3. **`FrameCodec::wire_encryption()` accessor** added.
+4. JS SDK `FrameCodec`: `encode(body)` no longer accepts an `encryption` parameter; the codec's `wireEncryption` property (set by `withChaCha20Key` / `withAes256Key`) governs encryption. `decode()` returns `{ messageType, body }` (no `encryption` field).
+5. Documentation (README, framework-instruction, plan) updated to reference Protocol v3.
+
+### Compatibility
+
+- **Wire protocol**: breaking (v3 ≠ v2 frame offsets). All endpoints (Rust server, Rust client, JS client) must be upgraded together.
+- **Rust public API**: non-breaking — `PacketEnvelope.encryption` field retained as metadata; all method signatures unchanged.
+- **JS SDK API**: `FrameCodec.encode()` drops the second parameter (internal usage only; `WscallClient` callers unaffected).
+
 ## [0.5.0] - 2026-07-28
 
 > **⚠️ BREAKING RELEASE**: This release introduces public API breaking changes (SemVer minor bump under 0.x). The wire protocol is **unchanged** — 0.5.0 nodes interoperate with 0.4.x nodes at the protocol level. However, the Rust public API and the JS SDK API have changed; downstream code must be updated. All four Rust crates must be upgraded **together**. The companion `wscall-client-js` SDK received matching changes.

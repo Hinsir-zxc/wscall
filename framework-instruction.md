@@ -17,7 +17,7 @@ WSCALL 在原生 WebSocket 之上承载一套自有的二进制帧协议，将�
 当前边界：
 
 - 提供 Rust 服务端、Rust 客户端与 JavaScript 客户端 SDK（`wscall-client-js`）。
-- 文件传输走“二进制复合帧 + 原始字节附件”（协议 v2），零 Base64 开销；大文件分块流式上传未纳入框架核心。
+- 文件传输走“二进制复合帧 + 原始字节附件”（协议 v3），零 Base64 开销；大文件分块流式上传未纳入框架核心。
 
 ---
 
@@ -55,17 +55,17 @@ wscall = { version = "0.5.0", features = ["full"] }
 
 ## 3. 交互协议
 
-### 3.1 帧格式（协议 v2）
+### 3.1 帧格式（协议 v3）
 
 双向传输均为如下二进制帧：
 
 ```
-| frame_len:u32(be) | message_type:u8 | encryption:u8 | payload:N bytes |
+| frame_len:u32(be) | message_type:u8 | payload:N bytes |
 ```
 
-- `frame_len`：后续 `message_type + encryption + payload` 的总长度。
+- `frame_len`：后续 `message_type + payload` 的总长度。
 - `message_type`：`0x00` = API（请求/响应）；`0x01` = 事件（发送/回执）。
-- `encryption`：`0x00` = 明文；`0x01` = ChaCha20-Poly1305；`0x02` = AES-256-GCM。
+- 加密模式为连接级属性（由 PSK 配置或 ECDH 握手在连接建立时确定），不再逐帧携带。
 - 明文模式下 `payload` 为复合负载（见下）。
 - 加密模式下 `payload` 为 `12 字节 nonce + 密文(含 tag)`，解密后为复合负载。
 
@@ -167,7 +167,7 @@ API 响应：
 
 ### 3.4 文件参数策略
 
-JSON 传参与文件混合采用“参数引用 + 二进制附件段”（协议 v2）：
+JSON 传参与文件混合采用“参数引用 + 二进制附件段”（协议 v3）：
 
 - `params` / `data` 中以 `{"$file": "attachment-id"}` 引用附件。
 - 附件以原始二进制段追加在 JSON 元数据之后，零 Base64 开销。
@@ -441,7 +441,7 @@ cargo test --workspace --all-features
 
 1. 协议两层模型：WebSocket 二进制帧承载 WSCALL 帧，WSCALL 帧负载承载复合结构（JSON 元数据 + 二进制附件段）。
 2. 加密在协议层统一处理，业务层无感。支持 PSK 预共享密钥与 ECDH 动态密钥协商两种模式，前者适合可信内网，后者适合零信任场景。
-3. 文件走二进制复合帧（协议 v2），附件以原始字节传输，消除 Base64 的 33% 流量膨胀。
+3. 文件走二进制复合帧（协议 v3），附件以原始字节传输，消除 Base64 的 33% 流量膨胀。
 4. 服务端采用“读循环解码 + 信号量受限并发 handler + 预编码出站”模型，兼顾吞吐与背压。
 5. 客户端采用“无锁 pending 表 + 无锁出站句柄 + 并发事件 handler + 指数退避抖动”模型，兼顾并发与稳定重连。
 6. 库内日志统一 `tracing`，热路径无同步 IO 阻塞。

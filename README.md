@@ -2,6 +2,51 @@
 
 WSCALL is a lightweight WebSocket API framework with a custom binary frame protocol, a reusable Rust server crate, a reusable Rust client crate, a JavaScript client SDK, and a facade crate for consumers that prefer a single dependency.
 
+## When To Use WSCALL
+
+WSCALL targets **real-time, bidirectional, connection-oriented** communication where a single long-lived WebSocket carries both request/response RPC and server-pushed events.
+
+**Ideal project profiles:**
+
+- **Real-time dashboards & monitoring** — server pushes metric/state updates over the same connection that the client uses for queries; no polling, no separate subscription transport.
+- **Chat / collaboration backends** — message delivery, typing indicators, presence broadcasts, and file sharing all flow through one protocol with built-in event ACK.
+- **IoT & device management** — persistent connections with heartbeat keep-alive, binary-efficient framing, and per-connection encryption suit constrained or mobile networks.
+- **Game servers & live sessions** — low-latency bidirectional messaging with concurrent in-flight requests and zero-copy broadcast to many recipients.
+- **Internal micro-service RPC** — teams that want typed routes, validation, and exception mapping without pulling in a heavy IDL/codegen toolchain.
+- **Browser ↔ backend APIs** — the companion JS SDK (`wscall-client-js`) runs in both Node.js and browsers, making WSCALL a single-protocol choice for full-stack TypeScript/Rust architectures.
+
+**You probably want WSCALL when:**
+
+1. You need server push *and* client RPC on the same connection.
+2. You value a compact binary wire format over human-readable HTTP/JSON.
+3. You want built-in encryption (ChaCha20/AES-256-GCM/ECDH) without TLS termination complexity.
+4. You prefer “routes + filters + events” framework ergonomics over raw WebSocket handling.
+5. You need automatic reconnection with failover across multiple server nodes.
+
+## Comparison With Traditional RPC Frameworks
+
+| Dimension | WSCALL | gRPC | JSON-RPC over HTTP | REST |
+|-----------|--------|------|--------------------|------|
+| Transport | WebSocket (persistent, bidirectional) | HTTP/2 (streaming) | HTTP (request/response) | HTTP (request/response) |
+| Per-message overhead | 5-byte frame header + compact JSON (single-letter keys, numeric IDs); attachments as raw binary (zero Base64 tax) | 5-byte gRPC frame + HTTP/2 HEADERS per stream; Protobuf varint fields | Full HTTP headers per request (~200–500 B) + verbose JSON keys (`"jsonrpc"`, `"method"`, `"params"`) | Full HTTP headers per request + verbose JSON; file uploads need multipart or Base64 |
+| Server push | Native event broadcast & targeted push | Server streaming (per-call) | Not built-in | Not built-in (needs SSE/WS) |
+| Wire format | Compact binary frame + JSON envelope | Protobuf (IDL-required) | JSON text | JSON text |
+| Schema / IDL | None required (dynamic JSON params) | `.proto` + codegen | None | OpenAPI (optional) |
+| Encryption | Built-in ChaCha20 / AES-256-GCM / ECDH at frame level | TLS (transport level) | TLS | TLS |
+| Connection model | Long-lived, heartbeat keep-alive, auto-reconnect | Per-call or long-lived streams | Stateless per-request | Stateless per-request |
+| Bidirectionality | Full-duplex on a single connection | Full-duplex via streams | Client-initiated only | Client-initiated only |
+| Browser support | Native (WebSocket API + JS SDK) | Requires gRPC-Web proxy | Yes | Yes |
+| Setup complexity | Low (no codegen, no proxy) | Medium (protoc, codegen, sometimes Envoy) | Low | Low |
+| Best fit | Real-time bidirectional apps | High-throughput polyglot micro-services | Simple remote procedure calls | CRUD resource APIs |
+
+**Key differentiators:**
+
+1. **Zero-codegen developer experience** — define a route with a closure; no `.proto` files, no build-step code generation. Typed params are opt-in via `typed_route` / `validated_route`.
+2. **Events as a first-class citizen** — `broadcast_event` / `send_event_to` / `on_event` / event ACK are protocol-level primitives, not an afterthought layered on top of streaming.
+3. **Frame-level encryption without TLS** — useful for intranet deployments, WebSocket tunnels through plain proxies, or scenarios where TLS termination is impractical.
+4. **Single dependency, small footprint** — the facade crate `wscall` with `features = ["full"]` pulls in the entire framework; no sidecar proxies, no external schema registry.
+5. **Rust + JavaScript dual SDK** — the same binary protocol serves Rust backends and browser/Node.js frontends without a translation layer.
+
 ## Workspace Layout
 
 The repository is now organized as a Cargo workspace:
@@ -23,13 +68,15 @@ Each crate has a clear responsibility:
 
 ## Protocol Summary
 
-Each WebSocket binary message is encoded as:
+Each WebSocket binary message is encoded as (protocol v3, 5-byte header):
 
 ```text
-| frame_len:u32 | message_type:u8 | encryption:u8 | payload |
+| frame_len:u32 | message_type:u8 | payload |
 ```
 
-In protocol v2 the `payload` is a binary composite frame:
+The encryption mode is a connection-level property (determined by PSK config or ECDH handshake at connection time); it is not carried per-frame.
+
+The `payload` is a binary composite frame:
 
 ```text
 | meta_len:u32 | JSON envelope bytes | att_count:u8 | [attachment binary sections] |
@@ -66,15 +113,15 @@ Depend on only what you need:
 
 ```toml
 [dependencies]
-wscall-server = "0.5.0"
-wscall-client = "0.5.0"
+wscall-server = "0.5.1"
+wscall-client = "0.5.1"
 ```
 
 Or use the facade crate:
 
 ```toml
 [dependencies]
-wscall = { version = "0.5.0", features = ["full"] }
+wscall = { version = "0.5.1", features = ["full"] }
 ```
 
 ## Quick Start
@@ -253,7 +300,7 @@ Version history is tracked in `CHANGELOG.md`.
 
 1. `ChaCha20` and `AES256-GCM` are implemented in `FrameCodec`; the demos default to `ChaCha20`.
 2. `ECDH` mode uses X25519 via `x25519-dalek` (Rust) and `@noble/curves` (JS); session keys are always `ChaCha20-Poly1305`.
-3. Attachments are inline binary sections (protocol v2) suited to small and medium files.
+3. Attachments are inline binary sections (protocol v3) suited to small and medium files.
 4. Large-file chunking is not part of the current core protocol.
 5. The published crate and code identifiers have been renamed to `wscall`.
 6. JavaScript client SDK is available at `wscall-client-js`; it supports PSK and ECDH modes.

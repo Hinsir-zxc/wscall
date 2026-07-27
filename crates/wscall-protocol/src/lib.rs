@@ -154,7 +154,7 @@ impl TryFrom<u8> for EncryptionKind {
 
 /// Binary attachment carried alongside JSON params or event data.
 ///
-/// In protocol v2 the attachment payload is stored as raw bytes in a binary
+/// In protocol v3 the attachment payload is stored as raw bytes in a binary
 /// section appended after the JSON metadata, eliminating the 33% overhead of
 /// Base64 encoding used in protocol v1.
 ///
@@ -766,10 +766,18 @@ impl PacketEnvelope {
     }
 }
 
-/// Encodes and decodes WSCALL binary frames (protocol v2).
+/// Encodes and decodes WSCALL binary frames (protocol v3).
 ///
-/// Protocol v2 uses a composite payload format: JSON metadata followed by raw
+/// Protocol v3 uses a composite payload format: JSON metadata followed by raw
 /// binary attachment sections, eliminating the Base64 overhead of protocol v1.
+/// The frame header is 5 bytes (`frame_len:u32 | message_type:u8`); the
+/// per-frame encryption byte present in protocol v2 has been removed in favour
+/// of connection-level encryption (`wire_encryption`).
+///
+/// The encryption mode is a **connection-level** property stored in the codec
+/// (`wire_encryption`). It is determined once at connection setup (PSK config or
+/// ECDH handshake) and applies to every frame on that connection; the frame
+/// header no longer carries a per-frame encryption byte.
 ///
 /// The symmetric ciphers are constructed once when a key is configured and shared
 /// via [`Arc`] across every clone of the codec. This avoids redoing the key
@@ -778,6 +786,8 @@ impl PacketEnvelope {
 pub struct FrameCodec {
     aes256_cipher: Option<Arc<Aes256Gcm>>,
     chacha20_cipher: Option<Arc<ChaCha20Poly1305>>,
+    /// Connection-level encryption mode applied to every frame.
+    wire_encryption: EncryptionKind,
     /// Maximum total frame size (including the 4-byte length prefix).
     max_frame_bytes: usize,
 }
@@ -787,6 +797,7 @@ impl Default for FrameCodec {
         Self {
             aes256_cipher: None,
             chacha20_cipher: None,
+            wire_encryption: EncryptionKind::None,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
         }
     }
@@ -797,6 +808,7 @@ impl std::fmt::Debug for FrameCodec {
         f.debug_struct("FrameCodec")
             .field("aes256", &self.aes256_cipher.is_some())
             .field("chacha20", &self.chacha20_cipher.is_some())
+            .field("wire_encryption", &self.wire_encryption)
             .field("max_frame_bytes", &self.max_frame_bytes)
             .finish()
     }
@@ -811,12 +823,14 @@ impl FrameCodec {
     /// Configures a ChaCha20-Poly1305 key.
     ///
     /// The cipher is constructed eagerly so that subsequent frame encoding never
-    /// pays for the key schedule again.
+    /// pays for the key schedule again. Also sets `wire_encryption` to
+    /// [`EncryptionKind::ChaCha20`].
     pub fn with_chacha20_key(self, key: [u8; 32]) -> Self {
         let cipher = ChaCha20Poly1305::new_from_slice(&key)
             .expect("a 32-byte key is always valid for ChaCha20-Poly1305");
         Self {
             chacha20_cipher: Some(Arc::new(cipher)),
+            wire_encryption: EncryptionKind::ChaCha20,
             ..self
         }
     }
@@ -824,14 +838,21 @@ impl FrameCodec {
     /// Configures an AES256-GCM key.
     ///
     /// The cipher is constructed eagerly so that subsequent frame encoding never
-    /// pays for the AES key expansion again.
+    /// pays for the AES key expansion again. Also sets `wire_encryption` to
+    /// [`EncryptionKind::Aes256`].
     pub fn with_aes256_key(self, key: [u8; 32]) -> Self {
         let cipher =
             Aes256Gcm::new_from_slice(&key).expect("a 32-byte key is always valid for AES-256-GCM");
         Self {
             aes256_cipher: Some(Arc::new(cipher)),
+            wire_encryption: EncryptionKind::Aes256,
             ..self
         }
+    }
+
+    /// Returns the connection-level encryption mode used by this codec.
+    pub fn wire_encryption(&self) -> EncryptionKind {
+        self.wire_encryption
     }
 
     /// Sets the maximum total frame size (including the 4-byte length prefix).
@@ -847,38 +868,41 @@ impl FrameCodec {
         self.max_frame_bytes
     }
 
-    /// Encodes an envelope into a binary WSCALL frame (protocol v2 composite format).
+    /// Encodes an envelope into a binary WSCALL frame (protocol v3 composite format).
+    ///
+    /// Frame layout: `frame_len:u32 | message_type:u8 | payload`
     ///
     /// The composite payload layout (before encryption):
     /// ```text
     /// | meta_len:u32(be) | JSON_bytes | att_count:u8 | [att sections...] |
     /// ```
+    ///
+    /// The encryption mode is taken from `self.wire_encryption` (connection-level),
+    /// not from `packet.encryption`.
     pub fn encode(&self, packet: &PacketEnvelope) -> Result<Vec<u8>, ProtocolError> {
-        let max_payload = self.max_frame_bytes.saturating_sub(6);
+        let max_payload = self.max_frame_bytes.saturating_sub(5);
         let attachments = packet.body.attachments();
         let att_size: usize = attachments.iter().map(|a| a.wire_size()).sum();
         let message_type = packet.message_type as u8;
-        let encryption = packet.encryption as u8;
 
         // Plaintext fast path: build the final frame in a single buffer with no
         // intermediate copies. The JSON metadata is written directly into the
         // frame via `to_writer` (no temporary `json_bytes` Vec), and the
         // `frame_len` / `meta_len` prefixes are patched in place once known.
         //
-        // Layout: frame_len:u32 | msg_type:u8 | enc:u8 | meta_len:u32 | json | att_count:u8 | [atts]
-        if packet.encryption == EncryptionKind::None {
-            let mut frame = Vec::with_capacity(4 + 2 + 4 + 1 + att_size + 64);
+        // Layout: frame_len:u32 | msg_type:u8 | meta_len:u32 | json | att_count:u8 | [atts]
+        if self.wire_encryption == EncryptionKind::None {
+            let mut frame = Vec::with_capacity(4 + 1 + 4 + 1 + att_size + 64);
             frame.extend_from_slice(&[0u8; 4]); // frame_len placeholder
             frame.push(message_type);
-            frame.push(encryption);
             frame.extend_from_slice(&[0u8; 4]); // meta_len placeholder
             serde_json::to_writer(&mut frame, &packet.body)?;
-            let json_len = frame.len() - 10;
+            let json_len = frame.len() - 9;
             frame.push(attachments.len() as u8);
             for att in attachments {
                 att.write_wire(&mut frame);
             }
-            let payload_len = frame.len() - 6;
+            let payload_len = frame.len() - 5;
             if payload_len > max_payload {
                 return Err(ProtocolError::PayloadTooLarge {
                     actual: payload_len,
@@ -887,7 +911,7 @@ impl FrameCodec {
             }
             let frame_len = (frame.len() - 4) as u32;
             frame[0..4].copy_from_slice(&frame_len.to_be_bytes());
-            frame[6..10].copy_from_slice(&(json_len as u32).to_be_bytes());
+            frame[5..9].copy_from_slice(&(json_len as u32).to_be_bytes());
             return Ok(frame);
         }
 
@@ -912,7 +936,7 @@ impl FrameCodec {
             });
         }
 
-        let payload = match packet.encryption {
+        let payload = match self.wire_encryption {
             EncryptionKind::ChaCha20 => self.encrypt_chacha20(&composite)?,
             EncryptionKind::Aes256 => self.encrypt_aes256(&composite)?,
             EncryptionKind::None => unreachable!("plaintext is handled by the fast path above"),
@@ -926,21 +950,24 @@ impl FrameCodec {
             });
         }
 
-        let frame_len = 2 + payload.len();
+        let frame_len = 1 + payload.len();
         let mut frame = Vec::with_capacity(4 + frame_len);
         frame.extend_from_slice(&(frame_len as u32).to_be_bytes());
         frame.push(message_type);
-        frame.push(encryption);
         frame.extend_from_slice(&payload);
         Ok(frame)
     }
 
-    /// Decodes a binary WSCALL frame back into an envelope (protocol v2 composite format).
+    /// Decodes a binary WSCALL frame back into an envelope (protocol v3 composite format).
+    ///
+    /// Frame layout: `frame_len:u32 | message_type:u8 | payload`
+    ///
+    /// The encryption mode is taken from `self.wire_encryption` (connection-level).
     ///
     /// Accepts [`Bytes`] so that plaintext attachment payloads can be extracted
     /// via zero-copy slicing of the original buffer (no intermediate `Vec`).
     pub fn decode(&self, frame: Bytes) -> Result<PacketEnvelope, ProtocolError> {
-        if frame.len() < 6 {
+        if frame.len() < 5 {
             return Err(ProtocolError::FrameTooShort);
         }
 
@@ -958,15 +985,14 @@ impl FrameCodec {
         }
 
         let message_type = MessageType::try_from(frame[4])?;
-        let encryption = EncryptionKind::try_from(frame[5])?;
 
         // Obtain the composite payload as `Bytes`. In the plaintext path this
         // is a zero-copy slice of the original frame buffer; in the encrypted
         // path the decrypted `Vec` is wrapped into a fresh `Bytes`.
-        let composite: Bytes = match encryption {
-            EncryptionKind::None => frame.slice(6..),
-            EncryptionKind::ChaCha20 => Bytes::from(self.decrypt_chacha20(&frame[6..])?),
-            EncryptionKind::Aes256 => Bytes::from(self.decrypt_aes256(&frame[6..])?),
+        let composite: Bytes = match self.wire_encryption {
+            EncryptionKind::None => frame.slice(5..),
+            EncryptionKind::ChaCha20 => Bytes::from(self.decrypt_chacha20(&frame[5..])?),
+            EncryptionKind::Aes256 => Bytes::from(self.decrypt_aes256(&frame[5..])?),
         };
 
         // Parse composite: meta_len:u32 | JSON | att_count:u8 | [att sections]
@@ -1000,7 +1026,7 @@ impl FrameCodec {
 
         Ok(PacketEnvelope {
             message_type,
-            encryption,
+            encryption: self.wire_encryption,
             body,
         })
     }
