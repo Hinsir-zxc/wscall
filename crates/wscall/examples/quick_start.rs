@@ -1,6 +1,6 @@
 use serde_json::json;
 use tokio::time::{Duration, sleep};
-use wscall::{WscallClient, WscallServer};
+use wscall::{WscallClient, WscallClientConfig, WscallServer};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     sleep(Duration::from_millis(100)).await;
 
-    let client = WscallClient::connect(url).await?;
+    let client = WscallClient::connect(url, WscallClientConfig::plaintext()).await?;
     let response = client
         .call("system.echo", json!({ "message": "hello" }), Vec::new())
         .await?;

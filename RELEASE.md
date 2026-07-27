@@ -7,9 +7,9 @@ This workspace publishes a crate family with dependency ordering:
 3. `wscall-client`
 4. `wscall`
 
-Current target release: `0.4.1`
+Current target release: `0.5.0`
 
-> **✅ NON-BREAKING RELEASE**: `0.4.1` is a performance-only patch release. It changes no public API and no wire format, and is fully interoperable with `0.4.0`. The only manifest change is a new `getrandom` dependency in `wscall-client`. See the `[0.4.1]` entry in `CHANGELOG.md` for details. The previous `0.4.0` release was the BREAKING protocol-v2 upgrade; nodes still on `0.3.0` or earlier must upgrade to `0.4.x` (all four crates together) and use a protocol-v2 `wscall-client-js` build.
+> **⚠️ BREAKING RELEASE**: `0.5.0` introduces public API breaking changes (SemVer minor under 0.x). The wire protocol is unchanged — 0.5.0 nodes interoperate with 0.4.x at the protocol level. Key changes: `FileAttachment.data` is now `Bytes`, `FrameCodec::decode` accepts `Bytes` by value, `on_event` handlers receive `Arc<EventMessage>`, and the client connect API is unified via `WscallClientConfig`. All four crates must be upgraded together. The companion `wscall-client-js` SDK received matching changes. See the `[0.5.0]` entry in `CHANGELOG.md` for full details.
 
 ## Pre-release checks
 
@@ -72,7 +72,7 @@ cargo publish -p wscall
 Run through this list before the first `cargo publish`:
 
 1. Working tree is clean or intentionally dirty for a local dry run.
-2. Workspace version is set to `0.4.1` and internal crate dependency pins also use `0.4.1`.
+2. Workspace version is set to `0.5.0` and internal crate dependency pins also use `0.5.0`.
 3. `CHANGELOG.md` includes the target version notes.
 4. `README.md` quick-start commands still work.
 5. Workspace quality gates pass.

@@ -2,7 +2,7 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
@@ -16,15 +16,16 @@ use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use wscall_protocol::{
-    EcdhKeypair, EncryptionKind, ErrorPayload, FileAttachment, FrameCodec, PacketBody,
-    PacketEnvelope, parse_peer_public,
+    EcdhKeypair, ErrorPayload, FileAttachment, FrameCodec, PacketBody, PacketEnvelope,
+    parse_peer_public,
 };
 
 use crate::client_types::{
     ClientConnectionEvent, ClientDisconnectEvent, ClientError, ClientOutbound, EventMessage,
+    WscallClientConfig,
 };
 
-type EventHandler = Arc<dyn Fn(EventMessage) -> BoxFuture<'static, Value> + Send + Sync>;
+type EventHandler = Arc<dyn Fn(Arc<EventMessage>) -> BoxFuture<'static, Value> + Send + Sync>;
 type ConnectionHandler = Arc<dyn Fn(ClientConnectionEvent) -> BoxFuture<'static, ()> + Send + Sync>;
 type DisconnectHandler = Arc<dyn Fn(ClientDisconnectEvent) -> BoxFuture<'static, ()> + Send + Sync>;
 type PendingSender = oneshot::Sender<Result<Value, ClientError>>;
@@ -55,8 +56,12 @@ fn client_metadata() -> Value {
 
 #[derive(Clone)]
 pub struct WscallClient {
-    url: Arc<str>,
-    codec: FrameCodec,
+    /// All candidate server URLs: `[primary] + config.failover_urls`.
+    urls: Arc<[Arc<str>]>,
+    /// Index into `urls` of the last successfully connected server.
+    last_url_idx: Arc<AtomicUsize>,
+    /// Unified connection configuration (codec, encryption, reconnect, ECDH).
+    config: WscallClientConfig,
     /// Lockless outbound channel handle. Reads via `load_full` never block, so
     /// `send_outbound` no longer takes a read lock and clones an `Option` per call.
     writer: Arc<ArcSwapOption<mpsc::Sender<ClientOutbound>>>,
@@ -66,16 +71,9 @@ pub struct WscallClient {
     connected_handlers: Arc<RwLock<Vec<ConnectionHandler>>>,
     disconnected_handlers: Arc<RwLock<Vec<DisconnectHandler>>>,
     default_timeout: Duration,
-    default_encryption: EncryptionKind,
-    /// Whether the supervisor should automatically reconnect after an
-    /// unexpected disconnect. Defaults to `true`; set to `false` for
-    /// fire-and-forget or externally-managed connection lifecycles.
-    auto_reconnect: bool,
     is_connected: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     connection_generation: Arc<AtomicU64>,
-    /// Whether the client uses ECDH dynamic key agreement.
-    use_ecdh: bool,
     /// Per-connection request id counter (starts at 1).
     next_request_id: Arc<AtomicU64>,
     /// Per-connection event id counter (starts at 1).
@@ -83,87 +81,49 @@ pub struct WscallClient {
 }
 
 impl WscallClient {
-    pub async fn connect(url: &str) -> Result<Self, ClientError> {
-        Self::connect_with_settings(
-            url,
-            FrameCodec::plaintext(),
-            EncryptionKind::None,
-            true,
-            false,
-        )
-        .await
-    }
-
-    /// Connect with explicit control over auto-reconnect behavior.
+    /// Connects to a WSCALL server with the given configuration.
     ///
-    /// When `auto_reconnect` is `false`, the client connects once and does not
-    /// retry after an unexpected disconnect — the caller is responsible for any
-    /// reconnection logic. When `true` (the default for [`connect`]), the
-    /// supervisor re-establishes the session with exponential backoff + jitter.
-    pub async fn connect_with_auto_reconnect(
-        url: &str,
-        auto_reconnect: bool,
-    ) -> Result<Self, ClientError> {
-        Self::connect_with_settings(
-            url,
-            FrameCodec::plaintext(),
-            EncryptionKind::None,
-            auto_reconnect,
-            false,
-        )
-        .await
-    }
-
-    pub async fn connect_with_chacha20(url: &str, key: [u8; 32]) -> Result<Self, ClientError> {
-        Self::connect_with_settings(
-            url,
-            FrameCodec::plaintext().with_chacha20_key(key),
-            EncryptionKind::ChaCha20,
-            true,
-            false,
-        )
-        .await
-    }
-
-    pub async fn connect_with_aes256(url: &str, key: [u8; 32]) -> Result<Self, ClientError> {
-        Self::connect_with_settings(
-            url,
-            FrameCodec::plaintext().with_aes256_key(key),
-            EncryptionKind::Aes256,
-            true,
-            false,
-        )
-        .await
-    }
-
-    /// Connect using ECDH dynamic key agreement.
+    /// This is the unified entry point for establishing a client connection.
+    /// Use [`WscallClientConfig`] to control encryption, ECDH key agreement,
+    /// auto-reconnect behavior, and failover URLs.
     ///
-    /// No pre-shared key is required. The client and server perform an X25519
-    /// handshake immediately after the WebSocket upgrade and derive a unique
-    /// 32-byte ChaCha20-Poly1305 session key. All subsequent frames are
-    /// encrypted with this key, which is unique per connection and never
-    /// transmitted over the wire.
-    pub async fn connect_with_ecdh(url: &str) -> Result<Self, ClientError> {
-        Self::connect_with_settings(
-            url,
-            FrameCodec::plaintext(),
-            EncryptionKind::ChaCha20,
-            true,
-            true,
-        )
-        .await
-    }
+    /// When [`WscallClientConfig::failover_urls`] is non-empty, the client
+    /// iterates through `[url] + failover_urls` on each connection attempt,
+    /// starting from the last successfully connected index. This provides
+    /// automatic failover for multi-node deployments.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use wscall_client::{WscallClient, WscallClientConfig};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// // ECDH dynamic key agreement (recommended default)
+    /// let client = WscallClient::connect("ws://127.0.0.1:9001/socket", WscallClientConfig::ecdh()).await?;
+    ///
+    /// // With failover URLs for high availability
+    /// let config = WscallClientConfig::ecdh()
+    ///     .with_failover_url("ws://backup1:9001/socket")
+    ///     .with_failover_url("ws://backup2:9001/socket");
+    /// let client = WscallClient::connect("ws://primary:9001/socket", config).await?;
+    ///
+    /// // Plaintext (development only)
+    /// let client = WscallClient::connect("ws://127.0.0.1:9001/socket", WscallClientConfig::plaintext()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn connect(url: &str, config: WscallClientConfig) -> Result<Self, ClientError> {
+        // Build the full URL list: primary first, then failover URLs.
+        let mut urls: Vec<Arc<str>> = Vec::with_capacity(1 + config.failover_urls.len());
+        urls.push(Arc::<str>::from(url));
+        for failover in &config.failover_urls {
+            urls.push(Arc::<str>::from(failover.as_str()));
+        }
 
-    async fn connect_with_settings(
-        url: &str,
-        codec: FrameCodec,
-        default_encryption: EncryptionKind,
-        auto_reconnect: bool,
-        use_ecdh: bool,
-    ) -> Result<Self, ClientError> {
         let client = Self {
-            url: Arc::<str>::from(url),
-            codec,
+            urls: urls.into(),
+            last_url_idx: Arc::new(AtomicUsize::new(0)),
+            config,
             writer: Arc::new(ArcSwapOption::new(None)),
             pending_api: Arc::new(DashMap::new()),
             pending_event: Arc::new(DashMap::new()),
@@ -171,12 +131,9 @@ impl WscallClient {
             connected_handlers: Arc::new(RwLock::new(Vec::new())),
             disconnected_handlers: Arc::new(RwLock::new(Vec::new())),
             default_timeout: Duration::from_secs(10),
-            default_encryption,
-            auto_reconnect,
             is_connected: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(AtomicBool::new(false)),
             connection_generation: Arc::new(AtomicU64::new(0)),
-            use_ecdh,
             next_request_id: Arc::new(AtomicU64::new(0)),
             next_event_id: Arc::new(AtomicU64::new(0)),
         };
@@ -193,16 +150,68 @@ impl WscallClient {
         Ok(client)
     }
 
+    /// Connect with plaintext transport (no encryption).
+    #[deprecated(
+        since = "0.5.0",
+        note = "use WscallClient::connect(url, WscallClientConfig::plaintext())"
+    )]
+    pub async fn connect_plaintext(url: &str) -> Result<Self, ClientError> {
+        Self::connect(url, WscallClientConfig::plaintext()).await
+    }
+
+    /// Connect with explicit control over auto-reconnect behavior.
+    #[deprecated(
+        since = "0.5.0",
+        note = "use WscallClient::connect(url, config) with WscallClientConfig::plaintext().with_auto_reconnect(v)"
+    )]
+    pub async fn connect_with_auto_reconnect(
+        url: &str,
+        auto_reconnect: bool,
+    ) -> Result<Self, ClientError> {
+        Self::connect(
+            url,
+            WscallClientConfig::plaintext().with_auto_reconnect(auto_reconnect),
+        )
+        .await
+    }
+
+    /// Connect with a pre-shared ChaCha20-Poly1305 key.
+    #[deprecated(
+        since = "0.5.0",
+        note = "use WscallClient::connect(url, WscallClientConfig::psk_chacha20(key))"
+    )]
+    pub async fn connect_with_chacha20(url: &str, key: [u8; 32]) -> Result<Self, ClientError> {
+        Self::connect(url, WscallClientConfig::psk_chacha20(key)).await
+    }
+
+    /// Connect with a pre-shared AES-256-GCM key.
+    #[deprecated(
+        since = "0.5.0",
+        note = "use WscallClient::connect(url, WscallClientConfig::psk_aes256(key))"
+    )]
+    pub async fn connect_with_aes256(url: &str, key: [u8; 32]) -> Result<Self, ClientError> {
+        Self::connect(url, WscallClientConfig::psk_aes256(key)).await
+    }
+
+    /// Connect using ECDH dynamic key agreement.
+    #[deprecated(
+        since = "0.5.0",
+        note = "use WscallClient::connect(url, WscallClientConfig::ecdh())"
+    )]
+    pub async fn connect_with_ecdh(url: &str) -> Result<Self, ClientError> {
+        Self::connect(url, WscallClientConfig::ecdh()).await
+    }
+
     pub fn is_connected(&self) -> bool {
         self.is_connected.load(Ordering::SeqCst)
     }
 
     pub async fn on_event<F, Fut>(&self, name: impl Into<String>, handler: F)
     where
-        F: Fn(EventMessage) -> Fut + Send + Sync + 'static,
+        F: Fn(Arc<EventMessage>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Value> + Send + 'static,
     {
-        let handler = Arc::new(move |event: EventMessage| {
+        let handler = Arc::new(move |event: Arc<EventMessage>| {
             Box::pin(handler(event)) as BoxFuture<'static, Value>
         });
         self.event_handlers
@@ -231,7 +240,7 @@ impl WscallClient {
             self.invoke_connection_handler(
                 handler,
                 ClientConnectionEvent {
-                    url: self.url.to_string(),
+                    url: self.current_url().to_string(),
                 },
             )
             .await;
@@ -272,7 +281,7 @@ impl WscallClient {
                     attachments,
                     metadata: client_metadata(),
                 },
-                self.default_encryption,
+                self.config.default_encryption,
             )))
             .await
             .is_err()
@@ -313,7 +322,7 @@ impl WscallClient {
                     metadata: client_metadata(),
                     expect_ack: true,
                 },
-                self.default_encryption,
+                self.config.default_encryption,
             )))
             .await
             .is_err()
@@ -400,13 +409,13 @@ impl WscallClient {
                 metadata,
                 expect_ack,
             } => {
-                let event = EventMessage {
+                let event = Arc::new(EventMessage {
                     event_id,
                     name: name.clone(),
                     data,
                     attachments,
                     metadata,
-                };
+                });
                 let handlers = self
                     .event_handlers
                     .read()
@@ -422,7 +431,7 @@ impl WscallClient {
                 let receipt = if handlers.is_empty() {
                     json!({ "handled": false })
                 } else {
-                    let futures = handlers.iter().map(|handler| handler(event.clone()));
+                    let futures = handlers.iter().map(|handler| handler(Arc::clone(&event)));
                     let results = join_all(futures).await;
                     results
                         .last()
@@ -439,7 +448,7 @@ impl WscallClient {
                                 receipt,
                                 error: None,
                             },
-                            self.default_encryption,
+                            self.config.default_encryption,
                         )))
                         .await;
                 }
@@ -480,7 +489,7 @@ impl WscallClient {
 
             // If auto_reconnect is disabled, the supervisor exits after the
             // first disconnect instead of retrying.
-            if !self.auto_reconnect {
+            if !self.config.auto_reconnect {
                 return;
             }
 
@@ -495,12 +504,43 @@ impl WscallClient {
         &self,
         generation: u64,
     ) -> Result<oneshot::Receiver<ClientError>, ClientError> {
-        let (mut socket, _) = connect_async(self.url.as_ref()).await?;
+        // Iterate through all candidate URLs starting from the last successful
+        // index. This provides sticky failover: reconnects prefer the last
+        // known-good server, falling through to alternatives on failure.
+        let start = self.last_url_idx.load(Ordering::Relaxed);
+        let count = self.urls.len();
+        let mut last_error: Option<ClientError> = None;
+
+        let mut socket = None;
+        for offset in 0..count {
+            let idx = (start + offset) % count;
+            match connect_async(self.urls[idx].as_ref()).await {
+                Ok((ws, _)) => {
+                    self.last_url_idx.store(idx, Ordering::Relaxed);
+                    socket = Some(ws);
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        url = self.urls[idx].as_ref(),
+                        error = %e,
+                        "failover: connection attempt failed, trying next"
+                    );
+                    last_error = Some(ClientError::WebSocket(e));
+                }
+            }
+        }
+
+        let mut socket = socket.ok_or_else(|| {
+            last_error.unwrap_or_else(|| {
+                ClientError::ConnectionClosed("all server URLs unreachable".to_string())
+            })
+        })?;
 
         // ECDH handshake: exchange X25519 public keys before splitting the
         // stream. The derived session key replaces the global codec for both
         // the writer and the reader.
-        let session_codec = if self.use_ecdh {
+        let session_codec = if self.config.use_ecdh {
             let keypair = EcdhKeypair::generate()?;
 
             // Send the client's 32-byte public key as a raw binary message.
@@ -523,7 +563,7 @@ impl WscallClient {
             let session_key = keypair.derive_session_key(&server_public);
             FrameCodec::plaintext().with_chacha20_key(session_key)
         } else {
-            self.codec.clone()
+            self.config.codec.clone()
         };
 
         let (mut sink, mut stream) = socket.split();
@@ -625,7 +665,7 @@ impl WscallClient {
                 };
 
                 match message {
-                    Ok(Message::Binary(bytes)) => match reader_codec.decode(&bytes) {
+                    Ok(Message::Binary(bytes)) => match reader_codec.decode(bytes) {
                         Ok(packet) => {
                             if matches!(packet.body, PacketBody::EventEmit { .. }) {
                                 // Event handlers may be slow and must compute an
@@ -725,10 +765,10 @@ impl WscallClient {
         }
 
         self.emit_disconnected(ClientDisconnectEvent {
-            url: self.url.to_string(),
+            url: self.current_url().to_string(),
             reason,
-            will_reconnect: !self.shutdown.load(Ordering::SeqCst) && self.auto_reconnect,
-            retry_after: (!self.shutdown.load(Ordering::SeqCst) && self.auto_reconnect)
+            will_reconnect: !self.shutdown.load(Ordering::SeqCst) && self.config.auto_reconnect,
+            retry_after: (!self.shutdown.load(Ordering::SeqCst) && self.config.auto_reconnect)
                 .then_some(Self::reconnect_delay(1)),
         })
         .await;
@@ -781,7 +821,7 @@ impl WscallClient {
 
     async fn emit_connected(&self) {
         let event = ClientConnectionEvent {
-            url: self.url.to_string(),
+            url: self.current_url().to_string(),
         };
         let handlers = self.connected_handlers.read().await.clone();
         for handler in handlers {
@@ -822,5 +862,11 @@ impl WscallClient {
         {
             tracing::error!("client disconnected handler panicked");
         }
+    }
+
+    /// Returns the URL of the last successfully connected server.
+    fn current_url(&self) -> &str {
+        let idx = self.last_url_idx.load(Ordering::Relaxed);
+        &self.urls[idx]
     }
 }

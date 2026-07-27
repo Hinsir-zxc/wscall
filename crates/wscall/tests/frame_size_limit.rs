@@ -40,7 +40,7 @@ async fn next_api_response(
             continue;
         };
 
-        let packet = codec.decode(&bytes).expect("frame should decode");
+        let packet = codec.decode(bytes).expect("frame should decode");
         if matches!(packet.body, PacketBody::ApiResponse { .. }) {
             return packet.body;
         }

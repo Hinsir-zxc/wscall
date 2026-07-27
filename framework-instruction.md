@@ -45,7 +45,7 @@ wscall (facade, feature-gated)
 
 ```toml
 [dependencies]
-wscall = { version = "0.1.1", features = ["full"] }
+wscall = { version = "0.5.0", features = ["full"] }
 ```
 
 - 仅服务端：`features = ["server"]`
@@ -171,7 +171,7 @@ JSON 传参与文件混合采用“参数引用 + 二进制附件段”（协议
 
 - `params` / `data` 中以 `{"$file": "attachment-id"}` 引用附件。
 - 附件以原始二进制段追加在 JSON 元数据之后，零 Base64 开销。
-- `FileAttachment::inline_text` / `inline_bytes` 构造；直接访问 `.data` 获取原始字节。
+- `FileAttachment::inline_text` / `inline_bytes` 构造；`.data` 字段为 `Bytes`（引用计数不可变缓冲，clone 仅增加引用计数）。
 - 单个附件 id/name/content_type 长度上限 255 字节，附件数量上限 255。
 
 ---
@@ -243,24 +243,37 @@ server.listen("127.0.0.1:9001").await?;
 ### 5.1 连接
 
 ```rust
-// 默认：自动重连（auto_reconnect = true）
-let client = WscallClient::connect(url).await?;
+// 统一入口：WscallClient::connect(url, config)
+// 默认配置（ECDH + ChaCha20 + 自动重连）
+let client = WscallClient::connect(url, WscallClientConfig::default()).await?;
 
-// 显式控制是否自动重连
-let client = WscallClient::connect_with_auto_reconnect(url, false).await?;
+// ECDH 动态密钥协商（推荐默认）
+let client = WscallClient::connect(url, WscallClientConfig::ecdh()).await?;
 
-// PSK 加密连接（默认 auto_reconnect = true）
-WscallClient::connect_with_chacha20(url, KEY).await?;
-WscallClient::connect_with_aes256(url, KEY).await?;
+// 明文连接（仅开发环境）
+let client = WscallClient::connect(url, WscallClientConfig::plaintext()).await?;
 
-// ECDH 动态密钥协商（无需预共享密钥）
-WscallClient::connect_with_ecdh(url).await?;
+// PSK 加密连接
+let client = WscallClient::connect(url, WscallClientConfig::psk_chacha20(KEY)).await?;
+let client = WscallClient::connect(url, WscallClientConfig::psk_aes256(KEY)).await?;
+
+// 禁用自动重连
+let config = WscallClientConfig::ecdh().with_auto_reconnect(false);
+let client = WscallClient::connect(url, config).await?;
+
+// 多服务器故障转移
+let config = WscallClientConfig::ecdh()
+    .with_failover_url("ws://backup1:9001/socket")
+    .with_failover_url("ws://backup2:9001/socket");
+let client = WscallClient::connect("ws://primary:9001/socket", config).await?;
 ```
 
-- `connect(url)`：明文连接，`auto_reconnect = true`（默认）。
-- `connect_with_auto_reconnect(url, auto_reconnect)`：明文连接，显式控制重连行为。当 `auto_reconnect = false` 时，断连后不自动重连，由调用方自行管理连接生命周期。
-- `connect_with_chacha20(url, key)` / `connect_with_aes256(url, key)`：PSK 加密连接，`auto_reconnect = true`。
-- `connect_with_ecdh(url)`：ECDH 动态密钥协商连接，握手后自动使用 ChaCha20-Poly1305 加密，`auto_reconnect = true`。重连时每条新连接重新握手生成新会话密钥，确保前向安全。
+- `WscallClientConfig` 结构体封装所有用户可调参数：`codec`、`default_encryption`、`auto_reconnect`、`use_ecdh`、`failover_urls`。
+- `Default` 实现采用 ECDH + ChaCha20 + 自动重连（推荐安全默认）。
+- 便捷构造：`ecdh()` / `plaintext()` / `psk_chacha20(key)` / `psk_aes256(key)`。
+- Builder 方法：`with_codec` / `with_default_encryption` / `with_auto_reconnect` / `with_use_ecdh` / `with_failover_url` / `with_failover_urls`。
+- **故障转移**：`failover_urls` 配置备用 URL 列表。连接/重连时从上次成功的 URL 索引开始，按顺序遍历 `[primary] + failover_urls`，首个连通即返回（sticky failover）。所有 URL 均失败后才进入指数退避等待。
+- 旧连接方法（`connect(url)`、`connect_with_auto_reconnect`、`connect_with_chacha20`、`connect_with_aes256`、`connect_with_ecdh`、`connect_with_settings`）已标记 `#[deprecated(since = "0.5.0")]`，内部转发至新统一路径。
 
 所有 `request_id` / `event_id` 使用 per-connection `AtomicU64` 计数器生成（JSON 数字，1–6 字节）。`connection_id` 保持 UUIDv7（每连接仅生成一次，非热路径）。
 
@@ -268,7 +281,7 @@ WscallClient::connect_with_ecdh(url).await?;
 
 - `call(route, params, attachments) -> Result<Value, ClientError>`：发起 API 请求，`request_id` 自动生成并匹配响应；默认超时 10s。
 - `send_event(name, data, attachments) -> Result<Value, ClientError>`：发出事件并等待 ACK。
-- `on_event(name, handler)`：注册服务端推送事件处理，多个 handler **并发执行**（`join_all`）。
+- `on_event(name, handler)`：注册服务端推送事件处理，handler 接收 `Arc<EventMessage>`（多 handler 共享同一分配，`Arc::clone` 仅增加引用计数），多个 handler **并发执行**（`join_all`）。
 - `on_connected(handler)` / `on_disconnected(handler)`：连接生命周期回调，断连事件含 `will_reconnect` 与 `retry_after`。
 
 ### 5.3 自动重连
@@ -319,7 +332,7 @@ WscallClient::connect_with_ecdh(url).await?;
 ## 7. 协议层性能要点（`FrameCodec`）
 
 - **加密器预计算缓存**：`ChaCha20Poly1305` / `Aes256Gcm` 在配置密钥时构造一次，以 `Arc` 在 codec 所有克隆间共享，编解码不再每帧重复密钥调度（AES-256 密钥扩展尤其受益）。
-- **明文解码零多余拷贝**：明文路径以 `Cow::Borrowed` 直接借用帧切片，跳过 `to_vec`。
+- **明文解码零拷贝**：明文路径以 `Bytes::slice()` 零拷贝切片直接共享帧底层缓冲，无分配；附件二进制段同样使用 `data.slice(pos..pos+len)` 零拷贝提取。
 - **单缓冲编码**：`encode` 明文路径直接构建最终帧（`serde_json::to_writer` 直写 + 原地回填长度前缀），去除中间 JSON 缓冲与多次全缓冲拷贝；加密路径同样去除中间 JSON 缓冲。
 - **单次解析反序列化**：`PacketBody::deserialize` 仅解析一次 JSON 对象后直接 move 字段，嵌套 `params`/`data`/`metadata`/`receipt` 不再二次遍历。
 - **加密前预检大小**：先校验 JSON 序列化结果再加密，避免对超限负载做无谓加密后丢弃。
@@ -333,7 +346,7 @@ WscallClient::connect_with_ecdh(url).await?;
 ```rust
 use serde_json::json;
 use tokio::time::{Duration, sleep};
-use wscall::{WscallClient, WscallServer};
+use wscall::{WscallClient, WscallClientConfig, WscallServer};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -346,7 +359,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     sleep(Duration::from_millis(100)).await;
 
-    let client = WscallClient::connect("ws://127.0.0.1:9010/socket").await?;
+    let client = WscallClient::connect(
+        "ws://127.0.0.1:9010/socket",
+        WscallClientConfig::plaintext(),
+    ).await?;
     let response = client
         .call("system.echo", json!({ "message": "hello" }), Vec::new())
         .await?;

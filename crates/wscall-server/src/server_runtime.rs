@@ -576,7 +576,7 @@ impl WscallServer {
                             continue;
                         }
 
-                        let packet = reader_codec.decode(&bytes)?;
+                        let packet = reader_codec.decode(bytes)?;
 
                         let spawn_handler = matches!(
                             &packet.body,

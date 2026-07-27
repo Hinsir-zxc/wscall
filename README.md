@@ -55,8 +55,8 @@ The framework supports two key modes, determined at connection time:
 **ECDH Dynamic Key Agreement** — based on X25519, each connection negotiates a unique 32-byte `ChaCha20-Poly1305` session key via an in-band handshake immediately after the WebSocket upgrade. The session key is never transmitted over the wire. This mode provides forward secrecy and is suitable for zero-trust deployments.
 
 - Server: `WscallServer::new().with_ecdh()`
-- Rust client: `WscallClient::connect_with_ecdh(url)`
-- JS client: `WscallClient.connectWithEcdh(url)`
+- Rust client: `WscallClient::connect(url, WscallClientConfig::ecdh())`
+- JS client: `WscallClient.connect(url, WscallClientConfig.ecdh())`
 
 The handshake exchanges 32-byte raw public keys as binary WebSocket messages, then derives `SHA-256("wscall-ecdh-v1" || shared_secret)` as the session key.
 
@@ -66,15 +66,15 @@ Depend on only what you need:
 
 ```toml
 [dependencies]
-wscall-server = "0.4.1"
-wscall-client = "0.4.1"
+wscall-server = "0.5.0"
+wscall-client = "0.5.0"
 ```
 
 Or use the facade crate:
 
 ```toml
 [dependencies]
-wscall = { version = "0.4.1", features = ["full"] }
+wscall = { version = "0.5.0", features = ["full"] }
 ```
 
 ## Quick Start
@@ -105,11 +105,14 @@ Minimal client:
 
 ```rust
 use serde_json::json;
-use wscall::WscallClient;
+use wscall::{WscallClient, WscallClientConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-	let client = WscallClient::connect("ws://127.0.0.1:9001/socket").await?;
+	let client = WscallClient::connect(
+		"ws://127.0.0.1:9001/socket",
+		WscallClientConfig::plaintext(),
+	).await?;
 	client
 		.on_connected(|event| async move {
 			println!("connected: {}", event.url);
@@ -130,21 +133,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-ECDH client (no pre-shared key needed):
+ECDH client (recommended default, no pre-shared key needed):
 
 ```rust
-let client = WscallClient::connect_with_ecdh("ws://127.0.0.1:9001/socket").await?;
+let client = WscallClient::connect(url, WscallClientConfig::ecdh()).await?;
+```
+
+Failover across multiple servers:
+
+```rust
+let config = WscallClientConfig::ecdh()
+    .with_failover_url("ws://backup1:9001/socket")
+    .with_failover_url("ws://backup2:9001/socket");
+let client = WscallClient::connect("ws://primary:9001/socket", config).await?;
 ```
 
 Client reconnect behavior:
 
-1. Unexpected disconnects trigger automatic reconnect attempts (controlled by `auto_reconnect`, default `true`).
+1. Unexpected disconnects trigger automatic reconnect attempts (controlled by `WscallClientConfig.auto_reconnect`, default `true`).
 2. The first retry waits 3 seconds.
 3. Each later retry doubles the delay (exponential backoff: 3s → 6s → 12s …).
 4. The retry delay is capped at 30 seconds.
 5. A random sub-second jitter is added to each retry to avoid thundering-herd reconnect storms.
 6. Calling `close()` stops reconnect attempts.
-7. Use `WscallClient::connect_with_auto_reconnect(url, false)` to disable automatic reconnection.
+7. Use `WscallClientConfig::default().with_auto_reconnect(false)` to disable automatic reconnection.
+8. When `failover_urls` is configured, each reconnect cycle iterates through all URLs (starting from the last successful one) before applying backoff delay.
 
 Runnable end-to-end quick start:
 
@@ -240,7 +253,7 @@ Version history is tracked in `CHANGELOG.md`.
 
 1. `ChaCha20` and `AES256-GCM` are implemented in `FrameCodec`; the demos default to `ChaCha20`.
 2. `ECDH` mode uses X25519 via `x25519-dalek` (Rust) and `@noble/curves` (JS); session keys are always `ChaCha20-Poly1305`.
-3. Attachments are inline Base64 and suited to small files.
+3. Attachments are inline binary sections (protocol v2) suited to small and medium files.
 4. Large-file chunking is not part of the current core protocol.
 5. The published crate and code identifiers have been renamed to `wscall`.
 6. JavaScript client SDK is available at `wscall-client-js`; it supports PSK and ECDH modes.

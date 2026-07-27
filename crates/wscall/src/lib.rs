@@ -7,7 +7,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! wscall = { version = "0.2.0", features = ["full"] }
+//! wscall = { version = "0.5.0", features = ["full"] }
 //! ```
 //!
 //! Use the `server` feature for `WscallServer`, the `client` feature for
@@ -45,4 +45,5 @@ pub use wscall_server::{
 #[cfg(feature = "client")]
 pub use wscall_client::{
     ClientConnectionEvent, ClientDisconnectEvent, ClientError, EventMessage, WscallClient,
+    WscallClientConfig,
 };

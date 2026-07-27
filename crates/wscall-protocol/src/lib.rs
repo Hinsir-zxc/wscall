@@ -3,13 +3,13 @@
 //! This crate contains the transport envelope, frame codec, encryption modes,
 //! and inline attachment model used by both the server and client crates.
 
-use std::borrow::Cow;
 use std::sync::Arc;
 
 use aes_gcm::{Aes256Gcm, KeyInit as AesKeyInit, Nonce as AesNonce, aead::Aead as AesAead};
+use bytes::Bytes;
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use getrandom::getrandom;
-use serde::de::Deserializer;
+use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -157,7 +157,11 @@ impl TryFrom<u8> for EncryptionKind {
 /// In protocol v2 the attachment payload is stored as raw bytes in a binary
 /// section appended after the JSON metadata, eliminating the 33% overhead of
 /// Base64 encoding used in protocol v1.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The payload uses [`Bytes`] (reference-counted, immutable) so that cloning
+/// an attachment — e.g. during ECDH broadcasts — is a cheap refcount bump
+/// rather than a deep copy of the entire buffer.
+#[derive(Debug, Clone)]
 pub struct FileAttachment {
     /// Attachment identifier referenced from JSON using `{ "$file": "..." }`.
     pub id: String,
@@ -165,8 +169,8 @@ pub struct FileAttachment {
     pub name: String,
     /// MIME type supplied by the sender.
     pub content_type: String,
-    /// Raw attachment payload bytes.
-    pub data: Vec<u8>,
+    /// Raw attachment payload bytes (zero-copy shared via `Bytes`).
+    pub data: Bytes,
 }
 
 impl FileAttachment {
@@ -177,21 +181,29 @@ impl FileAttachment {
         content_type: impl Into<String>,
         text: impl AsRef<str>,
     ) -> Self {
-        Self::inline_bytes(id, name, content_type, text.as_ref().as_bytes().to_vec())
+        Self::inline_bytes(
+            id,
+            name,
+            content_type,
+            Bytes::from(text.as_ref().to_owned()),
+        )
     }
 
     /// Builds a binary attachment from raw bytes.
+    ///
+    /// Accepts anything convertible into [`Bytes`] (`Vec<u8>`, `Bytes`,
+    /// `&'static [u8]`, etc.).
     pub fn inline_bytes(
         id: impl Into<String>,
         name: impl Into<String>,
         content_type: impl Into<String>,
-        bytes: Vec<u8>,
+        bytes: impl Into<Bytes>,
     ) -> Self {
         Self {
             id: id.into(),
             name: name.into(),
             content_type: content_type.into(),
-            data: bytes,
+            data: bytes.into(),
         }
     }
 
@@ -226,7 +238,10 @@ impl FileAttachment {
 
     /// Parses one attachment binary section from `data`, returning the
     /// attachment and the remaining unconsumed bytes.
-    pub(crate) fn read_wire(data: &[u8]) -> Result<(Self, &[u8]), ProtocolError> {
+    ///
+    /// The payload is extracted via [`Bytes::slice`] which shares the
+    /// underlying buffer (zero-copy) rather than allocating a new `Vec`.
+    pub(crate) fn read_wire(data: &Bytes) -> Result<(Self, Bytes), ProtocolError> {
         let mut pos = 0;
 
         // id
@@ -291,7 +306,8 @@ impl FileAttachment {
                 "truncated data".into(),
             ));
         }
-        let payload = data[pos..pos + data_len].to_vec();
+        // Zero-copy: slice shares the underlying Bytes buffer.
+        let payload = data.slice(pos..pos + data_len);
         pos += data_len;
 
         Ok((
@@ -301,8 +317,97 @@ impl FileAttachment {
                 content_type,
                 data: payload,
             },
-            &data[pos..],
+            data.slice(pos..),
         ))
+    }
+}
+
+// ─── Serde impls for FileAttachment ─────────────────────────────────────────
+//
+// `Bytes` does not implement Serialize/Deserialize out of the box. We provide
+// manual impls using `serialize_bytes` / `visit_bytes` so that the (rarely
+// used) JSON `a` field round-trips correctly.
+
+impl Serialize for FileAttachment {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(4))?;
+        map.serialize_entry("id", &self.id)?;
+        map.serialize_entry("name", &self.name)?;
+        map.serialize_entry("content_type", &self.content_type)?;
+        map.serialize_entry("data", &self.data.to_vec())?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for FileAttachment {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field {
+            Id,
+            Name,
+            ContentType,
+            Data,
+        }
+
+        struct FileAttachmentVisitor;
+
+        impl<'de> Visitor<'de> for FileAttachmentVisitor {
+            type Value = FileAttachment;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("struct FileAttachment")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut id = None;
+                let mut name = None;
+                let mut content_type = None;
+                let mut data: Option<Bytes> = None;
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        Field::Id => id = Some(map.next_value()?),
+                        Field::Name => name = Some(map.next_value()?),
+                        Field::ContentType => content_type = Some(map.next_value()?),
+                        Field::Data => {
+                            let bytes: Vec<u8> = map.next_value()?;
+                            data = Some(Bytes::from(bytes));
+                        }
+                    }
+                }
+                Ok(FileAttachment {
+                    id: id.ok_or_else(|| serde::de::Error::missing_field("id"))?,
+                    name: name.ok_or_else(|| serde::de::Error::missing_field("name"))?,
+                    content_type: content_type
+                        .ok_or_else(|| serde::de::Error::missing_field("content_type"))?,
+                    data: data.ok_or_else(|| serde::de::Error::missing_field("data"))?,
+                })
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let id = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let name = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let content_type = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                let bytes: Vec<u8> = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
+                Ok(FileAttachment {
+                    id,
+                    name,
+                    content_type,
+                    data: Bytes::from(bytes),
+                })
+            }
+        }
+
+        const FIELDS: &[&str] = &["id", "name", "content_type", "data"];
+        deserializer.deserialize_struct("FileAttachment", FIELDS, FileAttachmentVisitor)
     }
 }
 
@@ -831,7 +936,10 @@ impl FrameCodec {
     }
 
     /// Decodes a binary WSCALL frame back into an envelope (protocol v2 composite format).
-    pub fn decode(&self, frame: &[u8]) -> Result<PacketEnvelope, ProtocolError> {
+    ///
+    /// Accepts [`Bytes`] so that plaintext attachment payloads can be extracted
+    /// via zero-copy slicing of the original buffer (no intermediate `Vec`).
+    pub fn decode(&self, frame: Bytes) -> Result<PacketEnvelope, ProtocolError> {
         if frame.len() < 6 {
             return Err(ProtocolError::FrameTooShort);
         }
@@ -852,11 +960,13 @@ impl FrameCodec {
         let message_type = MessageType::try_from(frame[4])?;
         let encryption = EncryptionKind::try_from(frame[5])?;
 
-        // Decrypt (or borrow) the composite payload.
-        let composite: Cow<'_, [u8]> = match encryption {
-            EncryptionKind::None => Cow::Borrowed(&frame[6..]),
-            EncryptionKind::ChaCha20 => Cow::Owned(self.decrypt_chacha20(&frame[6..])?),
-            EncryptionKind::Aes256 => Cow::Owned(self.decrypt_aes256(&frame[6..])?),
+        // Obtain the composite payload as `Bytes`. In the plaintext path this
+        // is a zero-copy slice of the original frame buffer; in the encrypted
+        // path the decrypted `Vec` is wrapped into a fresh `Bytes`.
+        let composite: Bytes = match encryption {
+            EncryptionKind::None => frame.slice(6..),
+            EncryptionKind::ChaCha20 => Bytes::from(self.decrypt_chacha20(&frame[6..])?),
+            EncryptionKind::Aes256 => Bytes::from(self.decrypt_aes256(&frame[6..])?),
         };
 
         // Parse composite: meta_len:u32 | JSON | att_count:u8 | [att sections]
@@ -870,12 +980,12 @@ impl FrameCodec {
         }
         let json_slice = &composite[4..4 + meta_len];
         let att_count = composite[4 + meta_len] as usize;
-        let mut att_data = &composite[4 + meta_len + 1..];
+        let mut att_data = composite.slice(4 + meta_len + 1..);
 
-        // Parse binary attachment sections.
+        // Parse binary attachment sections (zero-copy via Bytes::slice).
         let mut attachments = Vec::with_capacity(att_count);
         for _ in 0..att_count {
-            let (att, rest) = FileAttachment::read_wire(att_data)?;
+            let (att, rest) = FileAttachment::read_wire(&att_data)?;
             attachments.push(att);
             att_data = rest;
         }
@@ -974,7 +1084,7 @@ pub fn encode_frame(packet: &PacketEnvelope) -> Result<Vec<u8>, ProtocolError> {
 }
 
 /// Helper for decoding a plaintext frame without constructing a custom codec.
-pub fn decode_frame(frame: &[u8]) -> Result<PacketEnvelope, ProtocolError> {
+pub fn decode_frame(frame: Bytes) -> Result<PacketEnvelope, ProtocolError> {
     FrameCodec::plaintext().decode(frame)
 }
 
@@ -1028,8 +1138,8 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::{
-        EncryptionKind, FileAttachment, FrameCodec, PacketBody, PacketEnvelope, ProtocolError,
-        decode_frame, encode_frame,
+        Bytes, EncryptionKind, FileAttachment, FrameCodec, PacketBody, PacketEnvelope,
+        ProtocolError, decode_frame, encode_frame,
     };
     use serde_json::json;
 
@@ -1045,7 +1155,7 @@ mod tests {
         });
 
         let encoded = encode_frame(&packet).expect("encode plaintext");
-        let decoded = decode_frame(&encoded).expect("decode plaintext");
+        let decoded = decode_frame(Bytes::from(encoded)).expect("decode plaintext");
         assert!(matches!(decoded.encryption, EncryptionKind::None));
     }
 
@@ -1065,7 +1175,7 @@ mod tests {
         );
 
         let encoded = codec.encode(&packet).expect("encode aes256");
-        let decoded = codec.decode(&encoded).expect("decode aes256");
+        let decoded = codec.decode(Bytes::from(encoded)).expect("decode aes256");
         assert!(matches!(decoded.encryption, EncryptionKind::Aes256));
     }
 
@@ -1086,14 +1196,14 @@ mod tests {
         });
 
         let encoded = encode_frame(&packet).expect("encode with attachment");
-        let decoded = decode_frame(&encoded).expect("decode with attachment");
+        let decoded = decode_frame(Bytes::from(encoded)).expect("decode with attachment");
 
         let atts = decoded.body.attachments();
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].id, "f1");
         assert_eq!(atts[0].name, "test.bin");
         assert_eq!(atts[0].content_type, "application/octet-stream");
-        assert_eq!(atts[0].data, vec![1, 2, 3, 4, 5]);
+        assert_eq!(&atts[0].data[..], &[1, 2, 3, 4, 5]);
     }
 
     #[test]
@@ -1119,13 +1229,13 @@ mod tests {
             .encode(&packet)
             .expect("encode encrypted with attachment");
         let decoded = codec
-            .decode(&encoded)
+            .decode(Bytes::from(encoded))
             .expect("decode encrypted with attachment");
 
         let atts = decoded.body.attachments();
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].id, "f2");
-        assert_eq!(atts[0].data, b"hello world");
+        assert_eq!(&atts[0].data[..], b"hello world");
     }
 
     #[test]
@@ -1165,7 +1275,7 @@ mod tests {
         assert!(encoded.len() > 64);
 
         let error = codec
-            .decode(&encoded)
+            .decode(Bytes::from(encoded))
             .expect_err("oversized frame should fail");
         assert!(matches!(error, ProtocolError::FrameTooLarge { .. }));
     }

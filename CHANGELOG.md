@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and the project follows Semantic Versioning.
 
+## [0.5.0] - 2026-07-28
+
+> **⚠️ BREAKING RELEASE**: This release introduces public API breaking changes (SemVer minor bump under 0.x). The wire protocol is **unchanged** — 0.5.0 nodes interoperate with 0.4.x nodes at the protocol level. However, the Rust public API and the JS SDK API have changed; downstream code must be updated. All four Rust crates must be upgraded **together**. The companion `wscall-client-js` SDK received matching changes.
+
+### Breaking Changes
+
+1. **`FileAttachment.data` is now `Bytes`** — changed from `Vec<u8>` to `bytes::Bytes` (reference-counted immutable buffer). Clone is a cheap refcount bump; `Bytes::slice()` enables zero-copy sub-range access. Manual `Serialize`/`Deserialize` impl (wire format unchanged).
+2. **`FrameCodec::decode` accepts `Bytes` by value** — signature changed from `decode(&self, frame: &[u8])` to `decode(&self, frame: Bytes)`. The plaintext path uses `frame.slice(6..)` for zero-copy payload extraction (no allocation); the encrypted path decrypts into a fresh `Bytes`. Aligns with tungstenite 0.30's `Message::Binary(Bytes)`.
+3. **`on_event` handler receives `Arc<EventMessage>`** — the event handler signature changed from `Fn(EventMessage)` to `Fn(Arc<EventMessage>)`. Multiple handlers share the same allocation via `Arc::clone` (refcount bump) instead of per-handler deep copies.
+4. **Unified `WscallClient::connect(url, config)`** — a new `WscallClientConfig` struct bundles `codec`, `default_encryption`, `auto_reconnect`, and `use_ecdh`. The single `connect(url, config)` entry point replaces the previous six connect variants.
+5. **Deprecated legacy connect methods** — `connect(url)`, `connect_with_auto_reconnect`, `connect_with_chacha20`, `connect_with_aes256`, `connect_with_ecdh`, and `connect_with_settings` are all `#[deprecated(since = "0.5.0")]` and forward to the new unified path.
+
+### Added
+
+1. `WscallClientConfig` struct with `Default` (ECDH + ChaCha20 + auto-reconnect), convenience constructors (`ecdh()`, `plaintext()`, `psk_chacha20(key)`, `psk_aes256(key)`), and builder methods (`with_codec`, `with_default_encryption`, `with_auto_reconnect`, `with_use_ecdh`).
+2. **Client-side failover** — `WscallClientConfig.failover_urls` field (with `with_failover_url` / `with_failover_urls` builders) accepts backup server URLs. On connect and reconnect the client iterates through `[primary] + failover_urls` starting from the last successfully connected index (sticky failover), providing automatic failover for multi-node deployments without external load balancers.
+3. `wscall-protocol` now depends on the `bytes` crate (workspace dependency).
+4. `FileAttachment::inline_bytes` accepts `impl Into<Bytes>` for ergonomic construction.
+5. JS SDK: `WscallClientConfig` class with static factories (`ecdh()`, `plaintext()`, `pskChaCha20(key)`, `pskAes256(key)`) and builder methods (including `withFailoverUrl` / `withFailoverUrls`); unified `WscallClient.connect(url, config)` entry point with matching failover support.
+
+### Changed
+
+1. Protocol decode path: plaintext frames use `Bytes::slice()` for zero-copy payload access; attachment binary sections use `data.slice(pos..pos+len)` instead of `to_vec()`.
+2. Client `WscallClient` struct stores a single `config: WscallClientConfig` field instead of four separate fields.
+3. `decode_frame` free function signature updated to accept `Bytes`.
+
 ## [0.4.1] - 2026-07-26
 
 A non-breaking performance release. Fully compatible with `0.4.0` — no public API or wire-protocol changes; the four crates interoperate with `0.4.0` nodes and can be upgraded independently. The companion `wscall-client-js` received matching codec optimizations in its own repository.

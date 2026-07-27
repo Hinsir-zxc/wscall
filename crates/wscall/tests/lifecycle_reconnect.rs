@@ -10,7 +10,10 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
-use wscall::{EncryptionKind, FrameCodec, PacketBody, PacketEnvelope, WscallClient, WscallServer};
+use wscall::{
+    EncryptionKind, FrameCodec, PacketBody, PacketEnvelope, WscallClient, WscallClientConfig,
+    WscallServer,
+};
 
 static NEXT_PORT: AtomicU16 = AtomicU16::new(29100);
 
@@ -43,7 +46,7 @@ async fn run_test_protocol_server(
     while let Some(message) = stream.next().await {
         match message? {
             Message::Binary(bytes) => {
-                let packet = codec.decode(&bytes)?;
+                let packet = codec.decode(bytes)?;
                 if let PacketBody::ApiRequest {
                     request_id,
                     route,
@@ -117,7 +120,7 @@ async fn lifecycle_callbacks_fire_for_client_and_server() {
     let server_task = tokio::spawn(async move { server.listen(&address).await });
     sleep(Duration::from_millis(100)).await;
 
-    let client = WscallClient::connect(&url)
+    let client = WscallClient::connect(&url, WscallClientConfig::plaintext())
         .await
         .expect("client should connect");
     let (client_conn_tx, mut client_conn_rx) = mpsc::unbounded_channel();
@@ -174,7 +177,7 @@ async fn client_reconnects_after_unexpected_disconnect() {
     let first_server = tokio::spawn(run_test_protocol_server(address.clone(), "first", true));
     sleep(Duration::from_millis(100)).await;
 
-    let client = WscallClient::connect(&url)
+    let client = WscallClient::connect(&url, WscallClientConfig::plaintext())
         .await
         .expect("client should connect");
     let (connected_tx, mut connected_rx) = mpsc::unbounded_channel();

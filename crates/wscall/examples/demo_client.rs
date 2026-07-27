@@ -1,5 +1,7 @@
+use std::sync::Arc;
+
 use serde_json::json;
-use wscall::{FileAttachment, WscallClient};
+use wscall::{FileAttachment, WscallClient, WscallClientConfig};
 
 const DEMO_CHACHA20_KEY: [u8; 32] = [0x42; 32];
 
@@ -11,13 +13,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --ecdh: use ECDH dynamic key agreement (no pre-shared key needed).
     let use_ecdh = std::env::args().any(|a| a == "--ecdh");
-    let client = if use_ecdh {
+    let config = if use_ecdh {
         println!("connecting in ECDH mode (dynamic key agreement)");
-        WscallClient::connect_with_ecdh("ws://127.0.0.1:9001/socket").await?
+        WscallClientConfig::ecdh()
     } else {
         println!("connecting in PSK mode (ChaCha20)");
-        WscallClient::connect_with_chacha20("ws://127.0.0.1:9001/socket", DEMO_CHACHA20_KEY).await?
+        WscallClientConfig::psk_chacha20(DEMO_CHACHA20_KEY)
     };
+    let client = WscallClient::connect("ws://127.0.0.1:9001/socket", config).await?;
 
     client
         .on_connected(|event| async move {
@@ -35,14 +38,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
 
     client
-        .on_event("system.notice", |event| async move {
+        .on_event("system.notice", |event: Arc<_>| async move {
             println!("notice: {}", serde_json::Value::Object(event.data.clone()));
             json!({ "received": true })
         })
         .await;
 
     client
-        .on_event("chat.message", |event| async move {
+        .on_event("chat.message", |event: Arc<_>| async move {
             println!(
                 "chat event: {}",
                 serde_json::Value::Object(event.data.clone())

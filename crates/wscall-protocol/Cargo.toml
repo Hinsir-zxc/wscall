@@ -17,6 +17,7 @@ all-features = true
 
 [dependencies]
 aes-gcm.workspace = true
+bytes.workspace = true
 chacha20poly1305.workspace = true
 getrandom.workspace = true
 serde.workspace = true
