@@ -47,15 +47,13 @@ async fn next_api_response(
     }
 }
 
-/// An oversized uplink frame must be answered with a 413 error response while
-/// the connection stays open: a subsequent well-formed request still succeeds.
+/// A frame whose declared header length mismatches the actual payload is
+/// rejected with a 413 error response while the connection stays open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn oversized_frame_returns_413_and_keeps_connection_open() {
+async fn mismatched_frame_header_returns_413_and_keeps_connection_open() {
     let (address, url) = next_address();
 
-    // Small limit so a modest probe frame already exceeds it.
-    let max_frame_bytes = 200usize;
-    let mut server = WscallServer::new().with_max_frame_bytes(max_frame_bytes);
+    let mut server = WscallServer::new();
     server.route("system.echo", |ctx| async move {
         Ok(json!({ "message": ctx.param("message") }))
     });
@@ -63,18 +61,21 @@ async fn oversized_frame_returns_413_and_keeps_connection_open() {
     let server_task = tokio::spawn(async move { server.listen(&address).await });
     sleep(Duration::from_millis(100)).await;
 
-    // Raw WebSocket client bypasses the SDK's encode-side size check.
     let (mut ws, _) = connect_async(&url)
         .await
         .expect("ws connect should succeed");
     let codec = FrameCodec::plaintext();
 
-    // 1) Send an oversized binary frame (larger than max_frame_bytes, well
-    //    within the WebSocket-level headroom) and expect a 413 error response.
-    let oversized = vec![0u8; max_frame_bytes + 100];
-    ws.send(Message::Binary(oversized.into()))
+    // 1) Craft a frame with a bogus declared length (first 4 bytes) that does
+    //    NOT match the actual payload size. The frame is small enough to pass
+    //    the WebSocket-level limit but fails the WSCALL header check.
+    let mut bogus_frame = Vec::new();
+    bogus_frame.extend_from_slice(&9999u32.to_be_bytes()); // declared = 9999
+    bogus_frame.push(0x00); // message_type = Api
+    bogus_frame.extend_from_slice(b"some payload");
+    ws.send(Message::Binary(bogus_frame.into()))
         .await
-        .expect("send oversized");
+        .expect("send bogus frame");
 
     let error_body = next_api_response(&mut ws, &codec).await;
     match error_body {
@@ -131,5 +132,57 @@ async fn oversized_frame_returns_413_and_keeps_connection_open() {
     }
 
     let _ = ws.close(None).await;
+    server_task.abort();
+}
+
+/// A frame exceeding `max_frame_bytes` is rejected at the WebSocket protocol
+/// layer (tungstenite closes the connection) — no 413 is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_frame_closes_connection() {
+    let (address, url) = next_address();
+
+    let max_frame_bytes = 200usize;
+    let mut server = WscallServer::new().with_max_frame_bytes(max_frame_bytes);
+    server.route("system.echo", |ctx| async move {
+        Ok(json!({ "message": ctx.param("message") }))
+    });
+
+    let server_task = tokio::spawn(async move { server.listen(&address).await });
+    sleep(Duration::from_millis(100)).await;
+
+    let (mut ws, _) = connect_async(&url)
+        .await
+        .expect("ws connect should succeed");
+
+    // Drain the initial system.notice event so it doesn't interfere.
+    let _ = timeout(Duration::from_secs(5), ws.next()).await;
+
+    // Send a frame larger than max_frame_bytes; tungstenite will reject it at
+    // the WebSocket level and close the connection.
+    let oversized = vec![0u8; max_frame_bytes + 100];
+    let _ = ws.send(Message::Binary(oversized.into())).await;
+
+    // The connection should be closed by the server. We may need to skip
+    // a ping frame or two before seeing the close.
+    let mut closed = false;
+    for _ in 0..5 {
+        match timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Err(_))) | Ok(None) => {
+                closed = true;
+                break;
+            }
+            Ok(Some(Ok(Message::Close(_)))) => {
+                closed = true;
+                break;
+            }
+            Ok(Some(Ok(_))) => continue, // skip pings/other frames
+            Err(_) => break,
+        }
+    }
+    assert!(
+        closed,
+        "connection should have been closed after oversized frame"
+    );
+
     server_task.abort();
 }

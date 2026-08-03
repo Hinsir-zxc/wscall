@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -35,6 +36,14 @@ pub(crate) enum ServerOutbound {
 /// passed directly to the writer/reader tasks at spawn time.
 pub(crate) struct ClientEntry {
     pub sender: mpsc::Sender<ServerOutbound>,
+    /// Per-connection idle timeout set by auth_handler (overrides global).
+    /// Stored for introspection; the reader loop uses the value captured
+    /// at connection setup time.
+    #[allow(dead_code)]
+    pub idle_timeout: Option<Duration>,
+    /// Identity context produced by auth_handler, shared via Arc to all
+    /// request/event handlers on this connection (zero-copy reads).
+    pub auth_context: Option<Arc<Map<String, Value>>>,
 }
 
 /// Shared, lock-free table of live client outbound channels.
@@ -78,6 +87,8 @@ pub struct ServerConnectionContext {
     pub(crate) connection_id: String,
     pub(crate) peer_addr: Option<SocketAddr>,
     pub(crate) server: ServerHandle,
+    pub(crate) authenticated: bool,
+    pub(crate) auth_context: Option<Arc<Map<String, Value>>>,
 }
 
 impl ServerConnectionContext {
@@ -94,6 +105,16 @@ impl ServerConnectionContext {
     /// Returns the peer IP as a string when available.
     pub fn peer_ip(&self) -> Option<String> {
         self.peer_addr.map(|addr| addr.ip().to_string())
+    }
+
+    /// Returns whether this connection passed authentication.
+    pub fn authenticated(&self) -> bool {
+        self.authenticated
+    }
+
+    /// Returns the auth context produced by the auth_handler, if any.
+    pub fn auth_context(&self) -> Option<&Map<String, Value>> {
+        self.auth_context.as_deref()
     }
 
     /// Returns a server handle for outbound event operations.
@@ -149,6 +170,7 @@ pub struct ApiContext {
     pub(crate) attachments: Vec<FileAttachment>,
     pub(crate) metadata: Value,
     pub(crate) server: ServerHandle,
+    pub(crate) auth_context: Option<Arc<Map<String, Value>>>,
 }
 
 /// Trait for custom parameter validation after JSON binding.
@@ -262,6 +284,12 @@ impl ApiContext {
         &self.server
     }
 
+    /// Returns the auth context produced by the auth_handler for this
+    /// connection, or `None` if no auth_handler is configured.
+    pub fn auth_context(&self) -> Option<&Map<String, Value>> {
+        self.auth_context.as_deref()
+    }
+
     /// Returns a simplified JSON view of incoming attachments.
     pub fn attachment_summaries(&self) -> Vec<Value> {
         self.attachments
@@ -289,6 +317,7 @@ pub struct EventContext {
     pub(crate) attachments: Vec<FileAttachment>,
     pub(crate) metadata: Value,
     pub(crate) server: ServerHandle,
+    pub(crate) auth_context: Option<Arc<Map<String, Value>>>,
 }
 
 impl EventContext {
@@ -336,6 +365,12 @@ impl EventContext {
     pub fn server(&self) -> &ServerHandle {
         &self.server
     }
+
+    /// Returns the auth context produced by the auth_handler for this
+    /// connection, or `None` if no auth_handler is configured.
+    pub fn auth_context(&self) -> Option<&Map<String, Value>> {
+        self.auth_context.as_deref()
+    }
 }
 
 /// Context passed to the global exception handler.
@@ -372,6 +407,11 @@ impl ApiError {
     /// Constructs a 500 internal error.
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new("internal_error", message, 500)
+    }
+
+    /// Constructs a 401 unauthorized error.
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self::new("unauthorized", message, 401)
     }
 
     /// Constructs an error with an explicit code and status.
@@ -416,4 +456,84 @@ pub enum ServerError {
     IdleTimeout(String),
     #[error("outbound queue is full for connection {0}")]
     OutboundQueueFull(String),
+    #[error("authentication failed: {0}")]
+    AuthFailed(String),
+}
+
+/// Context passed to the server `auth_handler` during the handshake phase.
+///
+/// Contains the credential string submitted by the client and connection
+/// metadata needed to make an authentication decision.
+#[derive(Clone)]
+pub struct AuthContext {
+    /// The credential string (e.g. a token) submitted by the client.
+    pub credential: String,
+    /// Peer socket address of the connecting client.
+    pub peer_addr: Option<SocketAddr>,
+    /// The logical connection id assigned to this connection.
+    pub connection_id: String,
+}
+
+impl AuthContext {
+    /// Returns the credential string submitted by the client.
+    pub fn credential(&self) -> &str {
+        &self.credential
+    }
+
+    /// Returns the peer socket address when available.
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer_addr
+    }
+
+    /// Returns the peer IP as a string when available.
+    pub fn peer_ip(&self) -> Option<String> {
+        self.peer_addr.map(|addr| addr.ip().to_string())
+    }
+
+    /// Returns the logical connection id.
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
+    }
+}
+
+/// Output returned by the server `auth_handler` upon successful authentication.
+///
+/// Carries an optional per-connection session timeout and an identity context
+/// object that will be shared (via `Arc`) with all subsequent route and event
+/// handlers on this connection.
+#[derive(Clone, Debug)]
+pub struct AuthOutput {
+    /// Per-connection idle timeout. Overrides the global 45s default.
+    pub session_timeout: Option<Duration>,
+    /// Identity context (user_id, roles, permissions, etc.) accessible from
+    /// all route/event handlers via `ctx.auth_context()`.
+    pub context: Map<String, Value>,
+}
+
+impl AuthOutput {
+    /// Creates an empty auth output with no session timeout and no context.
+    pub fn new() -> Self {
+        Self {
+            session_timeout: None,
+            context: Map::new(),
+        }
+    }
+
+    /// Builder: set a per-connection session timeout.
+    pub fn with_session_timeout(mut self, timeout: Duration) -> Self {
+        self.session_timeout = Some(timeout);
+        self
+    }
+
+    /// Builder: set the identity context object.
+    pub fn with_context(mut self, context: Map<String, Value>) -> Self {
+        self.context = context;
+        self
+    }
+}
+
+impl Default for AuthOutput {
+    fn default() -> Self {
+        Self::new()
+    }
 }

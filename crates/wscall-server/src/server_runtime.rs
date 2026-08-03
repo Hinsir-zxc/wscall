@@ -23,9 +23,11 @@ use wscall_protocol::{
     PacketBody, PacketEnvelope, ProtocolError, parse_peer_public,
 };
 
+use crate::rate_limiter::{RateLimiter, RateLimiterState, Verdict};
 use crate::server_types::{
-    ApiContext, ApiError, ClientEntry, EventContext, ExceptionContext, ServerConnectionContext,
-    ServerDisconnectContext, ServerError, ServerHandle, ServerOutbound, ServerState,
+    ApiContext, ApiError, AuthContext, AuthOutput, ClientEntry, EventContext, ExceptionContext,
+    ServerConnectionContext, ServerDisconnectContext, ServerError, ServerHandle, ServerOutbound,
+    ServerState,
 };
 use crate::validation;
 
@@ -36,6 +38,8 @@ const SERVER_OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const SERVER_DEFAULT_MAX_IN_FLIGHT: usize = 64;
 /// Grace window given to the writer task to flush a close frame before abort.
 const SERVER_CLOSE_GRACE: Duration = Duration::from_millis(500);
+/// Maximum time the server waits for the client to send an auth frame.
+const SERVER_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 type ApiHandler =
     Arc<dyn Fn(ApiContext) -> BoxFuture<'static, Result<Value, ApiError>> + Send + Sync>;
@@ -49,6 +53,8 @@ type DisconnectHandler =
     Arc<dyn Fn(ServerDisconnectContext) -> BoxFuture<'static, ()> + Send + Sync>;
 type ExceptionHandler =
     Arc<dyn Fn(ExceptionContext) -> BoxFuture<'static, ErrorPayload> + Send + Sync>;
+type AuthHandler =
+    Arc<dyn Fn(AuthContext) -> BoxFuture<'static, Result<AuthOutput, ApiError>> + Send + Sync>;
 
 struct ApiRequestInput {
     request_id: u64,
@@ -185,6 +191,25 @@ impl ServerHandle {
     }
 }
 
+/// A high-performance WebSocket RPC server.
+///
+/// `WscallServer` manages route registration, filter chains, event handlers,
+/// connection lifecycle hooks, encryption configuration, and concurrency limits.
+/// Build the server with the builder-style `with_*` methods, register handlers,
+/// then call [`listen`](Self::listen) to start accepting connections.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use wscall_server::WscallServer;
+///
+/// #[tokio::main]
+/// async fn main() {
+///     let mut server = WscallServer::new();
+///     server.route("ping", |ctx| async { Ok(serde_json::json!("pong")) });
+///     server.listen("0.0.0.0:9000").await.unwrap();
+/// }
+/// ```
 pub struct WscallServer {
     state: Arc<ServerState>,
     routes: HashMap<String, ApiHandler>,
@@ -203,6 +228,10 @@ pub struct WscallServer {
     max_in_flight: usize,
     /// Maximum total frame size (including 4-byte length prefix).
     max_frame_bytes: usize,
+    /// Optional rate limiter for inbound traffic.
+    rate_limiter: Option<Arc<RateLimiterState>>,
+    /// Optional authentication handler invoked during the handshake phase.
+    auth_handler: Option<AuthHandler>,
 }
 
 impl Default for WscallServer {
@@ -212,6 +241,10 @@ impl Default for WscallServer {
 }
 
 impl WscallServer {
+    /// Creates a new server instance with default settings.
+    ///
+    /// Defaults: plaintext transport (no encryption), no connection cap,
+    /// 64 max in-flight handlers per connection, 100 MiB max frame size.
     pub fn new() -> Self {
         Self {
             state: Arc::new(ServerState::new()),
@@ -227,6 +260,8 @@ impl WscallServer {
             max_connections: None,
             max_in_flight: SERVER_DEFAULT_MAX_IN_FLIGHT,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            rate_limiter: None,
+            auth_handler: None,
         }
     }
 
@@ -245,12 +280,22 @@ impl WscallServer {
         self
     }
 
+    /// Enables ChaCha20-Poly1305 encryption with a pre-shared 32-byte key.
+    ///
+    /// All frames are encrypted using the given symmetric key. This is
+    /// mutually exclusive with [`with_ecdh`](Self::with_ecdh) and
+    /// [`with_aes256_key`](Self::with_aes256_key).
     pub fn with_chacha20_key(mut self, key: [u8; 32]) -> Self {
         self.codec = self.codec.clone().with_chacha20_key(key);
         self.default_encryption = EncryptionKind::ChaCha20;
         self
     }
 
+    /// Enables AES-256-GCM encryption with a pre-shared 32-byte key.
+    ///
+    /// All frames are encrypted using the given symmetric key. This is
+    /// mutually exclusive with [`with_ecdh`](Self::with_ecdh) and
+    /// [`with_chacha20_key`](Self::with_chacha20_key).
     pub fn with_aes256_key(mut self, key: [u8; 32]) -> Self {
         self.codec = self.codec.clone().with_aes256_key(key);
         self.default_encryption = EncryptionKind::Aes256;
@@ -284,6 +329,66 @@ impl WscallServer {
         self
     }
 
+    /// Configures a rate limiter for inbound traffic protection.
+    ///
+    /// The limiter operates at connection-level and/or IP-level granularity,
+    /// enforcing both message-frequency and byte-volume thresholds per time
+    /// window. Offenders can be temporarily banned (new connections rejected
+    /// at the TCP level, route requests answered with `503 service_busy`,
+    /// events silently discarded).
+    ///
+    /// See [`RateLimiter`] for configuration details.
+    pub fn with_rate_limiter(mut self, limiter: RateLimiter) -> Self {
+        self.rate_limiter = Some(Arc::new(limiter.build()));
+        self
+    }
+
+    /// Registers an authentication handler invoked during the handshake phase.
+    ///
+    /// When configured, the server expects the client to send an `AuthRequest`
+    /// frame (carrying a credential string) immediately after the optional
+    /// ECDH key exchange. The handler validates the credential and returns
+    /// an [`AuthOutput`] containing an optional per-connection session timeout
+    /// and an identity context object.
+    ///
+    /// If the handler returns `Err(ApiError)`, the server sends an
+    /// `AuthResponse { ok: false }` frame and closes the connection.
+    ///
+    /// If no `auth_handler` is configured, the server does not expect an
+    /// auth frame and all connections proceed without authentication.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use wscall_server::{WscallServer, AuthOutput, ApiError};
+    /// use serde_json::json;
+    ///
+    /// let mut server = WscallServer::new();
+    /// server.auth_handler(|ctx| async move {
+    ///     if ctx.credential() == "secret-token" {
+    ///         Ok(AuthOutput::new()
+    ///             .with_context(json!({"user_id": "u123"}).as_object().unwrap().clone()))
+    ///     } else {
+    ///         Err(ApiError::unauthorized("invalid token"))
+    ///     }
+    /// });
+    /// ```
+    pub fn auth_handler<F, Fut>(&mut self, handler: F)
+    where
+        F: Fn(AuthContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<AuthOutput, ApiError>> + Send + 'static,
+    {
+        let handler = Arc::new(move |ctx: AuthContext| {
+            Box::pin(handler(ctx)) as BoxFuture<'static, Result<AuthOutput, ApiError>>
+        });
+        self.auth_handler = Some(handler);
+    }
+
+    /// Returns a [`ServerHandle`] that can be cloned into handlers or external
+    /// tasks for server-push operations (broadcast / directed events).
+    ///
+    /// The handle is cheap to clone (internally reference-counted) and carries
+    /// the server's codec and encryption configuration.
     pub fn handle(&self) -> ServerHandle {
         ServerHandle {
             state: Arc::clone(&self.state),
@@ -293,6 +398,14 @@ impl WscallServer {
         }
     }
 
+    /// Registers an API route handler.
+    ///
+    /// When a client sends an `ApiRequest` whose `route` field matches the
+    /// given name, `handler` is invoked with the request's [`ApiContext`].
+    /// The handler returns `Ok(Value)` for a successful response or
+    /// `Err(ApiError)` to signal a failure.
+    ///
+    /// Registering the same route name again replaces the previous handler.
     pub fn route<F, Fut>(&mut self, route: impl Into<String>, handler: F)
     where
         F: Fn(ApiContext) -> Fut + Send + Sync + 'static,
@@ -304,6 +417,11 @@ impl WscallServer {
         self.routes.insert(route.into(), handler);
     }
 
+    /// Registers a route with automatic strongly-typed parameter binding.
+    ///
+    /// The raw JSON `params` payload is deserialized into `T` (zero-copy via
+    /// `bind_take`) before the handler is called. Deserialization failures
+    /// produce a 400 `bad_request` error automatically.
     pub fn typed_route<T, F, Fut>(&mut self, route: impl Into<String>, handler: F)
     where
         T: DeserializeOwned + Send + 'static,
@@ -323,6 +441,11 @@ impl WscallServer {
         });
     }
 
+    /// Registers a route with typed parameter binding **and** `validator::Validate`.
+    ///
+    /// Behaves like [`typed_route`](Self::typed_route) but additionally runs
+    /// struct-level validation on the deserialized `T`. Validation failures
+    /// produce a 400 error with per-field details in `ApiError::details`.
     pub fn validated_route<T, F, Fut>(&mut self, route: impl Into<String>, handler: F)
     where
         T: DeserializeOwned + Validate + Send + 'static,
@@ -349,6 +472,17 @@ impl WscallServer {
         });
     }
 
+    /// Registers a filter that runs before every API route handler.
+    ///
+    /// Filters apply **only** to `ApiRequest` packets (i.e. route calls);
+    /// they do **not** run for incoming events.
+    ///
+    /// Multiple filters execute **sequentially in registration order** (the
+    /// order in which `filter()` is called). Each filter receives the
+    /// [`ApiContext`] produced by the previous one and may mutate it (e.g.
+    /// inject auth info into `metadata`). If any filter returns `Err`, the
+    /// chain short-circuits and the error is sent back to the client without
+    /// invoking the route handler.
     pub fn filter<F, Fut>(&mut self, filter: F)
     where
         F: Fn(ApiContext) -> Fut + Send + Sync + 'static,
@@ -360,6 +494,11 @@ impl WscallServer {
         self.filters.push(filter);
     }
 
+    /// Registers an event handler for a named client-to-server event.
+    ///
+    /// Event handlers receive an [`EventContext`] and return a receipt
+    /// payload that is sent back to the client as an `EventAck`. Note that
+    /// registered [`filter`](Self::filter)s do **not** apply to events.
     pub fn event_handler<F, Fut>(&mut self, name: impl Into<String>, handler: F)
     where
         F: Fn(EventContext) -> Fut + Send + Sync + 'static,
@@ -371,6 +510,12 @@ impl WscallServer {
         self.event_handlers.insert(name.into(), handler);
     }
 
+    /// Registers a handler invoked when a new client connection is established.
+    ///
+    /// Multiple handlers may be registered; they run **concurrently** (via
+    /// `join_all`) so a slow handler does not delay the connection setup.
+    /// Handlers receive a [`ServerConnectionContext`] with the connection id,
+    /// peer address, and a [`ServerHandle`].
     pub fn on_connected<F, Fut>(&mut self, handler: F)
     where
         F: Fn(ServerConnectionContext) -> Fut + Send + Sync + 'static,
@@ -382,6 +527,11 @@ impl WscallServer {
         self.connection_handlers.push(handler);
     }
 
+    /// Registers a handler invoked when a client connection is dropped.
+    ///
+    /// Multiple handlers may be registered; they run **concurrently**.
+    /// Handlers receive a [`ServerDisconnectContext`] with the connection id,
+    /// peer address, disconnect reason, and a [`ServerHandle`].
     pub fn on_disconnected<F, Fut>(&mut self, handler: F)
     where
         F: Fn(ServerDisconnectContext) -> Fut + Send + Sync + 'static,
@@ -393,6 +543,15 @@ impl WscallServer {
         self.disconnect_handlers.push(handler);
     }
 
+    /// Registers a global exception handler that transforms errors into
+    /// [`ErrorPayload`]s before they are sent to the client.
+    ///
+    /// The exception handler applies to **both** API route errors and event
+    /// handler errors. When no exception handler is registered, the default
+    /// behaviour is [`ApiError::into_payload`].
+    ///
+    /// The [`ExceptionContext::message_kind`] field distinguishes the source:
+    /// `"api"` for route errors and `"event"` for event errors.
     pub fn exception_handler<F, Fut>(&mut self, handler: F)
     where
         F: Fn(ExceptionContext) -> Fut + Send + Sync + 'static,
@@ -403,6 +562,14 @@ impl WscallServer {
         }));
     }
 
+    /// Binds to `address` and starts accepting WebSocket connections.
+    ///
+    /// This method consumes the server and runs indefinitely. Each accepted
+    /// connection is handled in a dedicated Tokio task with its own reader/
+    /// writer pair, heartbeat, and idle-timeout logic.
+    ///
+    /// The address format is a standard socket address, e.g. `"0.0.0.0:9000"`.
+    /// Clients connect via `ws://<host>:<port>/socket`.
     pub async fn listen(self, address: &str) -> Result<(), ServerError> {
         let listener = TcpListener::bind(address).await?;
         tracing::info!(%address, "wscall server listening on ws://{address}/socket");
@@ -411,6 +578,21 @@ impl WscallServer {
         let conn_sem = shared
             .max_connections
             .map(|max| Arc::new(Semaphore::new(max)));
+
+        // Spawn a background task that periodically purges stale rate limiter
+        // counters and expired bans to prevent unbounded memory growth.
+        if let Some(rl) = &shared.rate_limiter {
+            let rl = Arc::clone(rl);
+            let cleanup_interval = rl.cleanup_interval();
+            tokio::spawn(async move {
+                let mut ticker = interval(cleanup_interval);
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    rl.cleanup();
+                }
+            });
+        }
 
         loop {
             // Acquire a connection permit (when capped) before accepting so a
@@ -443,14 +625,26 @@ impl WscallServer {
         stream: TcpStream,
         peer: std::net::SocketAddr,
     ) -> Result<(), ServerError> {
-        // Configure WebSocket-level message size limit slightly above the
-        // WSCALL limit so that oversized frames can still be received and
-        // answered with a 413 error response instead of an abrupt close.
+        // Rate limiter: reject banned IPs before the WebSocket upgrade so
+        // the attacker never gets a session — the TCP stream is simply dropped.
+        if let Some(rl) = &self.rate_limiter {
+            if rl.is_ip_banned(peer.ip()) {
+                tracing::warn!(%peer, "rejected connection from banned IP");
+                return Ok(());
+            }
+        }
+
+        // Configure WebSocket-level message size limit equal to the WSCALL
+        // max_frame_bytes. Frames exceeding this are rejected by tungstenite
+        // at the protocol layer (connection closed), providing a hard memory
+        // bound against grossly oversized attack frames.
         let mut ws_config = WebSocketConfig::default();
-        ws_config.max_message_size = Some(self.max_frame_bytes + 1024 * 1024);
-        ws_config.max_frame_size = Some(self.max_frame_bytes + 1024 * 1024);
+        ws_config.max_message_size = Some(self.max_frame_bytes);
+        ws_config.max_frame_size = Some(self.max_frame_bytes);
         let mut websocket = accept_async_with_config(stream, Some(ws_config)).await?;
-        let connection_id = Uuid::now_v7().to_string();
+        // Use Arc<str> so cloning into spawned handler tasks is an atomic
+        // refcount increment (not a heap allocation) on the hot path.
+        let connection_id: Arc<str> = Arc::from(Uuid::now_v7().to_string());
         let peer_addr = Some(peer);
 
         // ECDH handshake: exchange X25519 public keys and derive a per-
@@ -464,15 +658,101 @@ impl WscallServer {
                 .with_max_frame_bytes(self.max_frame_bytes)
         };
 
+        // ── Auth phase ─────────────────────────────────────────────────────
+        // If an auth_handler is configured, wait for the client to send an
+        // AuthRequest frame (encrypted with the session key). Validate the
+        // credential and either proceed or reject the connection.
+        let mut conn_idle_timeout: Option<Duration> = None;
+        let mut conn_auth_context: Option<Arc<Map<String, Value>>> = None;
+
+        if let Some(auth_handler) = &self.auth_handler {
+            // Wait for the auth frame with a timeout.
+            let next = timeout(SERVER_AUTH_TIMEOUT, websocket.next()).await;
+            let auth_frame = match next {
+                Ok(Some(Ok(Message::Binary(bytes)))) => bytes,
+                _ => {
+                    return Err(ServerError::AuthFailed(
+                        "client did not send auth frame within timeout".to_string(),
+                    ));
+                }
+            };
+
+            // Decode the auth frame.
+            let envelope = session_codec.decode(Bytes::from(auth_frame.to_vec()))?;
+            let credential = match envelope.body {
+                PacketBody::AuthRequest { credential } => credential,
+                _ => {
+                    return Err(ServerError::AuthFailed(
+                        "expected AuthRequest frame during handshake".to_string(),
+                    ));
+                }
+            };
+
+            // Invoke the auth handler.
+            let auth_ctx = AuthContext {
+                credential,
+                peer_addr,
+                connection_id: connection_id.to_string(),
+            };
+
+            match AssertUnwindSafe(auth_handler(auth_ctx))
+                .catch_unwind()
+                .await
+            {
+                Ok(Ok(output)) => {
+                    // Auth success: send AuthResponse { ok: true }.
+                    conn_idle_timeout = output.session_timeout;
+                    if !output.context.is_empty() {
+                        conn_auth_context = Some(Arc::new(output.context));
+                    }
+                    let response = PacketEnvelope::with_encryption(
+                        PacketBody::AuthResponse {
+                            ok: true,
+                            session_timeout_secs: output.session_timeout.map(|d| d.as_secs()),
+                            error: None,
+                        },
+                        session_codec.wire_encryption(),
+                    );
+                    let encoded = session_codec.encode(&response)?;
+                    websocket.send(Message::Binary(encoded.into())).await?;
+                }
+                Ok(Err(api_error)) => {
+                    // Auth failure: send AuthResponse { ok: false } then close.
+                    let response = PacketEnvelope::with_encryption(
+                        PacketBody::AuthResponse {
+                            ok: false,
+                            session_timeout_secs: None,
+                            error: Some(api_error.into_payload()),
+                        },
+                        session_codec.wire_encryption(),
+                    );
+                    let encoded = session_codec.encode(&response)?;
+                    let _ = websocket.send(Message::Binary(encoded.into())).await;
+                    return Err(ServerError::AuthFailed(
+                        "authentication rejected".to_string(),
+                    ));
+                }
+                Err(_) => {
+                    return Err(ServerError::AuthFailed("auth handler panicked".to_string()));
+                }
+            }
+        }
+
         let (mut sink, mut stream) = websocket.split();
         let (tx, mut rx) = mpsc::channel::<ServerOutbound>(SERVER_OUTBOUND_QUEUE_CAPACITY);
 
         // Store the per-connection entry.
-        self.state
-            .clients
-            .insert(connection_id.clone(), ClientEntry { sender: tx.clone() });
+        self.state.clients.insert(
+            connection_id.to_string(),
+            ClientEntry {
+                sender: tx.clone(),
+                idle_timeout: conn_idle_timeout,
+                auth_context: conn_auth_context.clone(),
+            },
+        );
 
-        self.notify_connected(&connection_id, peer_addr).await;
+        self.notify_connected(&connection_id, peer_addr, conn_auth_context.clone())
+            .await;
 
         // The writer needs the per-connection codec to encode `Packet`
         // variants (ECDH mode).
@@ -525,12 +805,16 @@ impl WscallServer {
         // new frames, which is the desired backpressure signal.
         let in_flight = Arc::new(Semaphore::new(self.max_in_flight));
 
+        // Per-connection idle timeout: the auth handler's session_timeout
+        // (if any) overrides the global SERVER_IDLE_TIMEOUT.
+        let idle_timeout = conn_idle_timeout.unwrap_or(SERVER_IDLE_TIMEOUT);
+
         let result = async {
             self.handle()
                 .send_event_to(
                     &connection_id,
                     "system.notice",
-                    json!({ "message": "connected", "connection_id": connection_id })
+                    json!({ "message": "connected", "connection_id": connection_id.as_ref() })
                         .as_object()
                         .unwrap()
                         .clone(),
@@ -540,55 +824,130 @@ impl WscallServer {
                 .map_err(ServerError::Api)?;
 
             loop {
-                let next_message = timeout(SERVER_IDLE_TIMEOUT, stream.next()).await;
+                let next_message = timeout(idle_timeout, stream.next()).await;
                 let Some(message) =
-                    next_message.map_err(|_| ServerError::IdleTimeout(connection_id.clone()))?
+                    next_message.map_err(|_| ServerError::IdleTimeout(connection_id.to_string()))?
                 else {
                     break Ok(());
                 };
 
                 match message? {
                     Message::Binary(bytes) => {
-                        // WSCALL-level frame size check: reject oversized frames
-                        // with a 413 error response; the connection stays open.
-                        if bytes.len() > self.max_frame_bytes {
-                            let error_packet = PacketEnvelope::with_encryption(
-                                PacketBody::ApiResponse {
-                                    request_id: 0,
-                                    ok: false,
-                                    status: 413,
-                                    data: json!({}),
-                                    error: Some(ErrorPayload {
-                                        code: "frame_too_large".to_string(),
-                                        message: format!(
-                                            "frame size {} exceeds limit {}",
-                                            bytes.len(),
-                                            self.max_frame_bytes
-                                        ),
-                                        status: 413,
-                                        details: None,
-                                    }),
-                                    metadata: json!({}),
-                                },
+                        // ── Fast-reject: frame header validation ─────────────
+                        // Validate the declared frame_len (first 4 bytes, big-
+                        // endian u32) BEFORE any decode/decryption work. This
+                        // catches malformed or malicious frames in O(1) time.
+                        if bytes.len() < 5 {
+                            // Too short to contain a valid WSCALL frame header.
+                            let error_packet = Self::frame_error_packet(
+                                0,
+                                "frame_too_short",
+                                "frame must be at least 5 bytes",
                                 self.default_encryption,
                             );
                             let _ = self.queue_for(&connection_id, error_packet).await;
                             continue;
                         }
 
+                        let declared = u32::from_be_bytes([
+                            bytes[0], bytes[1], bytes[2], bytes[3],
+                        ]) as usize;
+
+                        if declared > self.max_frame_bytes || declared != bytes.len() - 4 {
+                            let error_packet = Self::frame_error_packet(
+                                0,
+                                "frame_too_large",
+                                &format!(
+                                    "declared frame_len {} is invalid (actual payload {}, limit {})",
+                                    declared,
+                                    bytes.len() - 4,
+                                    self.max_frame_bytes
+                                ),
+                                self.default_encryption,
+                            );
+                            let _ = self.queue_for(&connection_id, error_packet).await;
+                            continue;
+                        }
+
+                        // Defense-in-depth: actual size check (should not
+                        // trigger given the tungstenite max_message_size cap,
+                        // but guards against edge cases).
+                        if bytes.len() > self.max_frame_bytes {
+                            let error_packet = Self::frame_error_packet(
+                                0,
+                                "frame_too_large",
+                                &format!(
+                                    "frame size {} exceeds limit {}",
+                                    bytes.len(),
+                                    self.max_frame_bytes
+                                ),
+                                self.default_encryption,
+                            );
+                            let _ = self.queue_for(&connection_id, error_packet).await;
+                            continue;
+                        }
+
+                        let frame_len = bytes.len();
                         let packet = reader_codec.decode(bytes)?;
 
-                        let spawn_handler = matches!(
+                        // ── Rate limiting ────────────────────────────────────
+                        // Only rate-limit data-bearing messages (ApiRequest /
+                        // EventEmit); control frames (acks) pass through.
+                        let is_data_message = matches!(
                             &packet.body,
                             PacketBody::ApiRequest { .. } | PacketBody::EventEmit { .. }
                         );
+
+                        if is_data_message {
+                            if let Some(rl) = &self.rate_limiter {
+                                let verdict =
+                                    rl.check_and_record(&connection_id, peer.ip(), frame_len);
+                                match verdict {
+                                    Verdict::Allowed => {}
+                                    Verdict::Limited | Verdict::Banned => {
+                                        match &packet.body {
+                                            PacketBody::ApiRequest {
+                                                request_id, ..
+                                            } => {
+                                                // 503 service_busy
+                                                let resp = Self::service_busy_packet(
+                                                    *request_id,
+                                                    self.default_encryption,
+                                                );
+                                                let _ = self
+                                                    .queue_for(&connection_id, resp)
+                                                    .await;
+                                            }
+                                            PacketBody::EventEmit {
+                                                event_id, ..
+                                            } => {
+                                                // Silent discard: send ok:true
+                                                // empty receipt so the client
+                                                // protocol stays consistent.
+                                                let ack = Self::silent_ack_packet(
+                                                    *event_id,
+                                                    self.default_encryption,
+                                                );
+                                                let _ = self
+                                                    .queue_for(&connection_id, ack)
+                                                    .await;
+                                            }
+                                            _ => {}
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+
+                        let spawn_handler = is_data_message;
 
                         if spawn_handler {
                             let permit = in_flight.clone().acquire_owned().await.map_err(|_| {
                                 ServerError::Api(ApiError::internal("in-flight semaphore closed"))
                             })?;
                             let server = Arc::clone(&self);
-                            let conn_id = connection_id.clone();
+                            let conn_id = Arc::clone(&connection_id);
                             tokio::spawn(async move {
                                 let _permit = permit;
                                 if let Err(error) =
@@ -625,7 +984,7 @@ impl WscallServer {
         // Teardown: remove from the live table, attempt a graceful close, then
         // abort the writer. Aborting the writer drops the channel receiver so
         // any in-flight handler `queue_for` calls fail fast instead of hanging.
-        self.state.clients.remove(&connection_id);
+        self.state.clients.remove(&connection_id[..]);
         let _ = tx.try_send(ServerOutbound::Close);
         let _ = timeout(SERVER_CLOSE_GRACE, &mut writer).await;
         writer.abort();
@@ -747,6 +1106,9 @@ impl WscallServer {
                 );
             }
             PacketBody::ApiResponse { .. } => {}
+            // Auth frames are only valid during the handshake phase; ignore
+            // them if they arrive after the connection is established.
+            PacketBody::AuthRequest { .. } | PacketBody::AuthResponse { .. } => {}
         }
         Ok(())
     }
@@ -816,6 +1178,7 @@ impl WscallServer {
             attachments,
             metadata,
             server: self.handle(),
+            auth_context: self.lookup_auth_context(connection_id),
         };
 
         for filter in &self.filters {
@@ -891,6 +1254,7 @@ impl WscallServer {
             attachments,
             metadata,
             server: self.handle(),
+            auth_context: self.lookup_auth_context(connection_id),
         };
 
         let Some(handler) = self.event_handlers.get(&name) else {
@@ -986,8 +1350,14 @@ impl WscallServer {
         )
     }
 
-    async fn notify_connected(&self, connection_id: &str, peer_addr: Option<std::net::SocketAddr>) {
+    async fn notify_connected(
+        &self,
+        connection_id: &str,
+        peer_addr: Option<std::net::SocketAddr>,
+        auth_context: Option<Arc<Map<String, Value>>>,
+    ) {
         let handlers = self.connection_handlers.clone();
+        let authenticated = auth_context.is_some();
         // Run lifecycle handlers concurrently so a slow handler cannot delay
         // connection establishment (the reader loop starts right after this).
         let futures = handlers.into_iter().map(|handler| {
@@ -995,6 +1365,8 @@ impl WscallServer {
                 connection_id: connection_id.to_string(),
                 peer_addr,
                 server: self.handle(),
+                authenticated,
+                auth_context: auth_context.clone(),
             };
             AssertUnwindSafe(handler(context)).catch_unwind()
         });
@@ -1028,6 +1400,17 @@ impl WscallServer {
         }
     }
 
+    /// Looks up the auth context for a connection from the live client table.
+    ///
+    /// Returns a cheap `Arc::clone` (atomic refcount increment) or `None` if
+    /// the connection has no auth context or is no longer alive.
+    fn lookup_auth_context(&self, connection_id: &str) -> Option<Arc<Map<String, Value>>> {
+        self.state
+            .clients
+            .get(connection_id)
+            .and_then(|entry| entry.auth_context.clone())
+    }
+
     fn disconnect_reason(result: &Result<(), ServerError>) -> String {
         match result {
             Ok(()) => "connection closed".to_string(),
@@ -1041,5 +1424,63 @@ impl WscallServer {
             Some(handler) => handler(context).await,
             None => context.error.into_payload(),
         }
+    }
+
+    /// Builds a 413/4xx error response packet for frame-level rejections.
+    fn frame_error_packet(
+        request_id: u64,
+        code: &str,
+        message: &str,
+        encryption: EncryptionKind,
+    ) -> PacketEnvelope {
+        PacketEnvelope::with_encryption(
+            PacketBody::ApiResponse {
+                request_id,
+                ok: false,
+                status: 413,
+                data: json!({}),
+                error: Some(ErrorPayload {
+                    code: code.to_string(),
+                    message: message.to_string(),
+                    status: 413,
+                    details: None,
+                }),
+                metadata: json!({}),
+            },
+            encryption,
+        )
+    }
+
+    /// Builds a 503 `service_busy` response for rate-limited route requests.
+    fn service_busy_packet(request_id: u64, encryption: EncryptionKind) -> PacketEnvelope {
+        PacketEnvelope::with_encryption(
+            PacketBody::ApiResponse {
+                request_id,
+                ok: false,
+                status: 503,
+                data: json!({}),
+                error: Some(ErrorPayload {
+                    code: "service_busy".to_string(),
+                    message: "rate limit exceeded".to_string(),
+                    status: 503,
+                    details: None,
+                }),
+                metadata: json!({}),
+            },
+            encryption,
+        )
+    }
+
+    /// Builds a silent ok ack for rate-limited events (handler not invoked).
+    fn silent_ack_packet(event_id: u64, encryption: EncryptionKind) -> PacketEnvelope {
+        PacketEnvelope::with_encryption(
+            PacketBody::EventAck {
+                event_id,
+                ok: true,
+                receipt: json!({}),
+                error: None,
+            },
+            encryption,
+        )
     }
 }

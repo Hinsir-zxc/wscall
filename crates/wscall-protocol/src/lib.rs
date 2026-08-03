@@ -113,6 +113,8 @@ pub enum MessageType {
     Api = 0x00,
     /// Event emit or event acknowledgement.
     Event = 0x01,
+    /// Authentication request or response (handshake phase).
+    Auth = 0x02,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -122,6 +124,7 @@ impl TryFrom<u8> for MessageType {
         match value {
             0x00 => Ok(Self::Api),
             0x01 => Ok(Self::Event),
+            0x02 => Ok(Self::Auth),
             _ => Err(ProtocolError::UnknownMessageType(value)),
         }
     }
@@ -428,6 +431,8 @@ pub const K_API_REQUEST: u8 = 0;
 pub const K_EVENT_EMIT: u8 = 1;
 pub const K_API_RESPONSE: u8 = 2;
 pub const K_EVENT_ACK: u8 = 3;
+pub const K_AUTH_REQUEST: u8 = 4;
+pub const K_AUTH_RESPONSE: u8 = 5;
 
 /// JSON-level message body transported inside a WSCALL frame.
 ///
@@ -440,6 +445,8 @@ pub const K_EVENT_ACK: u8 = 3;
 /// | `EventEmit`   | 1 | `i` `n` `d` `a` `m` `e` |
 /// | `ApiResponse` | 2 | `i` `o` `s` `d` `m` [`er`] |
 /// | `EventAck`    | 3 | `i` `o` `rc` [`er`] |
+/// | `AuthRequest` | 4 | `c` |
+/// | `AuthResponse`| 5 | `o` [`st`] [`er`] |
 #[derive(Debug, Clone)]
 pub enum PacketBody {
     /// Client-to-server API request.
@@ -475,6 +482,14 @@ pub enum PacketBody {
         event_id: u64,
         ok: bool,
         receipt: Value,
+        error: Option<ErrorPayload>,
+    },
+    /// Client-to-server authentication request (handshake phase).
+    AuthRequest { credential: String },
+    /// Server-to-client authentication response (handshake phase).
+    AuthResponse {
+        ok: bool,
+        session_timeout_secs: Option<u64>,
         error: Option<ErrorPayload>,
     },
 }
@@ -568,6 +583,30 @@ impl Serialize for PacketBody {
                 s.serialize_entry("i", event_id)?;
                 s.serialize_entry("o", ok)?;
                 s.serialize_entry("rc", receipt)?;
+                if let Some(err) = error {
+                    s.serialize_entry("er", err)?;
+                }
+                s.end()
+            }
+            Self::AuthRequest { credential } => {
+                let mut s = serializer.serialize_map(Some(2))?;
+                s.serialize_entry("k", &K_AUTH_REQUEST)?;
+                s.serialize_entry("c", credential)?;
+                s.end()
+            }
+            Self::AuthResponse {
+                ok,
+                session_timeout_secs,
+                error,
+            } => {
+                let field_count =
+                    2 + usize::from(session_timeout_secs.is_some()) + usize::from(error.is_some());
+                let mut s = serializer.serialize_map(Some(field_count))?;
+                s.serialize_entry("k", &K_AUTH_RESPONSE)?;
+                s.serialize_entry("o", ok)?;
+                if let Some(st) = session_timeout_secs {
+                    s.serialize_entry("st", st)?;
+                }
                 if let Some(err) = error {
                     s.serialize_entry("er", err)?;
                 }
@@ -703,6 +742,14 @@ impl<'de> Deserialize<'de> for PacketBody {
                 receipt: map.remove("rc").unwrap_or(Value::Null),
                 error: take_error(&mut map)?,
             }),
+            K_AUTH_REQUEST => Ok(Self::AuthRequest {
+                credential: take_string(&mut map, "c")?,
+            }),
+            K_AUTH_RESPONSE => Ok(Self::AuthResponse {
+                ok: take_bool(&mut map, "o"),
+                session_timeout_secs: map.remove("st").and_then(|v| v.as_u64()),
+                error: take_error(&mut map)?,
+            }),
             _ => Err(serde::de::Error::custom(format!("unknown 'k' value: {k}"))),
         }
     }
@@ -713,6 +760,7 @@ impl PacketBody {
         match self {
             Self::ApiRequest { .. } | Self::ApiResponse { .. } => MessageType::Api,
             Self::EventEmit { .. } | Self::EventAck { .. } => MessageType::Event,
+            Self::AuthRequest { .. } | Self::AuthResponse { .. } => MessageType::Auth,
         }
     }
 

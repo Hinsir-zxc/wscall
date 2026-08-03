@@ -1,10 +1,14 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 use wscall::server::validation::{Validate, non_negative_i32, not_blank, positive_i32};
-use wscall::{ApiError, ExceptionContext, FileAttachment, ValidateParams, WscallServer};
+use wscall::{
+    ApiError, ExceptionContext, FileAttachment, RateLimitConfig, RateLimiter, ValidateParams,
+    WscallServer,
+};
 
 const DEMO_CHACHA20_KEY: [u8; 32] = [0x42; 32];
 
@@ -61,6 +65,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let history = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
     // --ecdh: use ECDH dynamic key agreement (no pre-shared key needed).
     let use_ecdh = std::env::args().any(|a| a == "--ecdh");
+    // --rate-limit: enable per-connection and per-IP rate limiting.
+    let use_rate_limit = std::env::args().any(|a| a == "--rate-limit");
+
     let mut server = if use_ecdh {
         println!("starting server in ECDH mode (dynamic key agreement)");
         WscallServer::new().with_ecdh()
@@ -68,6 +75,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("starting server in PSK mode (ChaCha20)");
         WscallServer::new().with_chacha20_key(DEMO_CHACHA20_KEY)
     };
+
+    if use_rate_limit {
+        println!("rate limiting enabled:");
+        println!("  connection: 50 msg/s, 1 MiB/s");
+        println!("  ip:         200 msg/10s, 5 MiB/10s");
+        println!("  ban:        30s after threshold exceeded");
+        server = server.with_rate_limiter(
+            RateLimiter::new()
+                // Per-connection: max 50 messages and 1 MiB per second.
+                .connection(
+                    RateLimitConfig::new(Duration::from_secs(1))
+                        .max_messages(50)
+                        .max_bytes(1024 * 1024),
+                )
+                // Per-IP (aggregates all connections from the same IP):
+                // max 200 messages and 5 MiB per 10 seconds.
+                .ip(RateLimitConfig::new(Duration::from_secs(10))
+                    .max_messages(200)
+                    .max_bytes(5 * 1024 * 1024))
+                // Ban offenders for 30 seconds: new connections from a banned
+                // IP are rejected at the TCP level; route requests on existing
+                // connections receive 503 service_busy; events are silently
+                // discarded.
+                .ban_duration(Duration::from_secs(30)),
+        );
+    }
 
     server.on_connected(|ctx| async move {
         println!(

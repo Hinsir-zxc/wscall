@@ -453,7 +453,9 @@ impl WscallClient {
                         .await;
                 }
             }
-            PacketBody::ApiRequest { .. } => {}
+            PacketBody::ApiRequest { .. }
+            | PacketBody::AuthRequest { .. }
+            | PacketBody::AuthResponse { .. } => {}
         }
     }
 
@@ -565,6 +567,53 @@ impl WscallClient {
         } else {
             self.config.codec.clone()
         };
+
+        // ── Auth phase ─────────────────────────────────────────────────
+        // When a credential is configured, submit it to the server as an
+        // AuthRequest frame (encrypted with the session key) and wait for
+        // the AuthResponse verdict before completing the connection.
+        if let Some(credential) = &self.config.credential {
+            let request = PacketEnvelope::new(PacketBody::AuthRequest {
+                credential: credential.clone(),
+            });
+            let encoded = session_codec.encode(&request)?;
+            socket
+                .send(Message::Binary(encoded.into()))
+                .await
+                .map_err(|e| ClientError::ConnectionClosed(e.to_string()))?;
+
+            let next = timeout(Duration::from_secs(10), socket.next()).await;
+            let response_frame = match next {
+                Ok(Some(Ok(Message::Binary(bytes)))) => bytes,
+                _ => {
+                    return Err(ClientError::ConnectionClosed(
+                        "auth handshake failed: no valid server response".to_string(),
+                    ));
+                }
+            };
+
+            let envelope = session_codec.decode(response_frame)?;
+            match envelope.body {
+                PacketBody::AuthResponse { ok: true, .. } => {}
+                PacketBody::AuthResponse {
+                    ok: false,
+                    error: Some(error),
+                    ..
+                } => {
+                    return Err(ClientError::AuthFailed(error));
+                }
+                PacketBody::AuthResponse { ok: false, .. } => {
+                    return Err(ClientError::ConnectionClosed(
+                        "authentication rejected by server".to_string(),
+                    ));
+                }
+                _ => {
+                    return Err(ClientError::ConnectionClosed(
+                        "auth handshake failed: unexpected response frame".to_string(),
+                    ));
+                }
+            }
+        }
 
         let (mut sink, mut stream) = socket.split();
         let (tx, mut rx) = mpsc::channel::<ClientOutbound>(CLIENT_OUTBOUND_QUEUE_CAPACITY);

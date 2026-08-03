@@ -7,9 +7,9 @@ This workspace publishes a crate family with dependency ordering:
 3. `wscall-client`
 4. `wscall`
 
-Current target release: `0.5.0`
+Current target release: `0.6.0`
 
-> **⚠️ BREAKING RELEASE**: `0.5.0` introduces public API breaking changes (SemVer minor under 0.x). The wire protocol is unchanged — 0.5.0 nodes interoperate with 0.4.x at the protocol level. Key changes: `FileAttachment.data` is now `Bytes`, `FrameCodec::decode` accepts `Bytes` by value, `on_event` handlers receive `Arc<EventMessage>`, and the client connect API is unified via `WscallClientConfig`. All four crates must be upgraded together. The companion `wscall-client-js` SDK received matching changes. See the `[0.5.0]` entry in `CHANGELOG.md` for full details.
+> **Security & resilience release**: `0.6.0` adds connection-level authentication (`auth_handler` + client credential), a server-side rate limiter with IP banning, and O(1) frame-header fast-reject validation. The wire protocol stays at v3 — 0.6.0 nodes interoperate with 0.5.1 nodes when the new auth handshake is not used. The Rust public API gains new `PacketBody`/`MessageType` enum variants (breaking for exhaustive matches under 0.x SemVer), so all four crates must be upgraded together. The companion `wscall-client-js` SDK received matching auth support. See the `[0.6.0]` entry in `CHANGELOG.md` for full details.
 
 ## Pre-release checks
 
@@ -30,7 +30,7 @@ cargo package -p wscall-protocol
 Update release-facing documents before publishing:
 
 1. Move relevant items from `Unreleased` to the target version in `CHANGELOG.md`.
-2. Confirm `README.md` still reflects the current examples, lifecycle APIs, reconnect behavior, and feature flags.
+2. Confirm `README.md` still reflects the current examples, lifecycle APIs, reconnect behavior, authentication, rate limiting, and feature flags.
 3. Confirm the version number is aligned across the workspace and all internal dependency pins.
 4. Confirm `RELEASE.md` still reflects the current publish order and target version.
 
@@ -72,7 +72,7 @@ cargo publish -p wscall
 Run through this list before the first `cargo publish`:
 
 1. Working tree is clean or intentionally dirty for a local dry run.
-2. Workspace version is set to `0.5.0` and internal crate dependency pins also use `0.5.0`.
+2. Workspace version is set to `0.6.0` and internal crate dependency pins also use `0.6.0`.
 3. `CHANGELOG.md` includes the target version notes.
 4. `README.md` quick-start commands still work.
 5. Workspace quality gates pass.

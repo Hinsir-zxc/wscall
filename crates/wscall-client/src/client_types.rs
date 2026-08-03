@@ -53,6 +53,12 @@ pub struct WscallClientConfig {
     /// `[primary] + failover_urls` starting from the last successfully
     /// connected index, providing automatic failover for multi-node deployments.
     pub failover_urls: Vec<String>,
+    /// Optional credential string (e.g. a token) submitted to the server
+    /// during the handshake phase. When the server has an `auth_handler`
+    /// configured, it validates this credential before the connection is
+    /// fully established. Leave as `None` when the server does not require
+    /// authentication.
+    pub credential: Option<String>,
 }
 
 impl Default for WscallClientConfig {
@@ -65,6 +71,7 @@ impl Default for WscallClientConfig {
             auto_reconnect: true,
             use_ecdh: true,
             failover_urls: Vec::new(),
+            credential: None,
         }
     }
 }
@@ -90,6 +97,7 @@ impl WscallClientConfig {
             auto_reconnect: true,
             use_ecdh: false,
             failover_urls: Vec::new(),
+            credential: None,
         }
     }
 
@@ -101,6 +109,7 @@ impl WscallClientConfig {
             auto_reconnect: true,
             use_ecdh: false,
             failover_urls: Vec::new(),
+            credential: None,
         }
     }
 
@@ -112,6 +121,7 @@ impl WscallClientConfig {
             auto_reconnect: true,
             use_ecdh: false,
             failover_urls: Vec::new(),
+            credential: None,
         }
     }
 
@@ -151,6 +161,18 @@ impl WscallClientConfig {
     /// Builder: set the full failover URL list (replaces any previously added).
     pub fn with_failover_urls(mut self, urls: Vec<String>) -> Self {
         self.failover_urls = urls;
+        self
+    }
+
+    /// Builder: set the credential string submitted to the server during the
+    /// handshake phase.
+    ///
+    /// When the server has an `auth_handler` configured, it validates this
+    /// credential (e.g. a bearer token) before the connection is fully
+    /// established. Authentication failures surface as
+    /// [`ClientError::AuthFailed`] from `connect`.
+    pub fn with_credential(mut self, credential: impl Into<String>) -> Self {
+        self.credential = Some(credential.into());
         self
     }
 }
@@ -207,4 +229,6 @@ pub enum ClientError {
     Timeout,
     #[error("remote error: {0:?}")]
     Remote(ErrorPayload),
+    #[error("authentication failed: {0:?}")]
+    AuthFailed(ErrorPayload),
 }

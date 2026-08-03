@@ -28,6 +28,6 @@ tokio-tungstenite.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 validator.workspace = true
-wscall-protocol = { path = "../wscall-protocol", version = "0.5.1" }
+wscall-protocol = { path = "../wscall-protocol", version = "0.6.0" }
 x25519-dalek.workspace = true
 sha2.workspace = true

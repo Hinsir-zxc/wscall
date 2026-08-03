@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and the project follows Semantic Versioning.
 
+## [0.6.0] - 2026-08-02
+
+> **Security & resilience release.** Introduces connection-level authentication (auth_handler), a server-side rate limiter with IP banning, and O(1) frame-header fast-reject validation. **Wire protocol stays at v3**: 0.6.0 nodes interoperate with 0.5.1 nodes as long as the new auth handshake is not used. The Rust public API gains new `PacketBody`/`MessageType` enum variants, which is a SemVer breaking change under 0.x for exhaustive matches — all four crates must be upgraded **together**. The companion `wscall-client-js` SDK received matching auth support.
+
+### Added
+
+1. **Connection-level authentication** — `WscallServer::auth_handler(F)` registers a handler invoked during the handshake (after ECDH, before the connection goes live). The client submits its credential as an encrypted `AuthRequest` frame; the server validates it and replies with `AuthResponse`. Servers without an `auth_handler` require no authentication (full backward compatibility).
+2. `AuthContext` (credential, peer_addr, connection_id) passed to the auth handler; `AuthOutput` returned on success with `with_session_timeout(d)` (per-connection idle timeout overriding the global 45s default) and `with_context(map)` (identity data such as user_id/roles/permissions).
+3. **Identity context propagation** — the `AuthOutput.context` map is shared via `Arc` (zero-copy) and accessible from every route/event handler via `ctx.auth_context() -> Option<&Map<String, Value>>`; `ServerConnectionContext` also exposes the authenticated identity in `on_connected`.
+4. **Client credential support** — `WscallClientConfig.credential` field with `with_credential()` builder (Rust) and `withCredential()` (JS). The credential is sent after the ECDH handshake as an encrypted frame; authentication failure surfaces as `ClientError::AuthFailed(ErrorPayload)` from `connect`.
+5. **Protocol: auth frame type** — `MessageType::Auth = 0x02`; packet kinds `K_AUTH_REQUEST = 4` (`{ k, c }`) and `K_AUTH_RESPONSE = 5` (`{ k, o, st?, er? }`); `PacketBody::AuthRequest` / `PacketBody::AuthResponse` variants.
+6. `ApiError::unauthorized(message)` convenience constructor (code `unauthorized`, HTTP status 401) and `ServerError::AuthFailed` variant.
+7. **Rate limiter** — `WscallServer::with_rate_limiter(RateLimiter)` with `RateLimitConfig::new(period).max_messages(n).max_bytes(n)`. Supports per-connection and per-IP windows (IP limits aggregate all connections from the same address). Offenders can be banned via `ban_duration(d)`: banned IPs are rejected at the TCP level before the WebSocket handshake, route requests on existing connections receive `503 service_busy`, and events are silently dropped.
+8. **Frame-header fast-reject validation** — the declared `frame_len` (first 4 bytes, big-endian u32) is validated in O(1) before any decode/decryption work; malformed frames (`frame_too_short` / `frame_length_mismatch`) are rejected without spending cipher or JSON work, mitigating resource-exhaustion attacks.
+9. Integration tests: `auth_handler.rs` (7 tests covering success, rejection, no-handler compatibility, session timeout, missing-credential timeout, and auth-context access in route/event handlers) and `rate_limiter.rs`.
+10. `demo_server` example gains a `--rate-limit` flag demonstrating per-connection + per-IP limits with 30s bans.
+
+### Compatibility
+
+- **Wire protocol**: unchanged (v3). 0.6.0 and 0.5.1 nodes interoperate when the server has no `auth_handler` and the client sends no credential. An auth-configured server closes connections from clients that skip the auth frame.
+- **Rust public API**: breaking for exhaustive matches — `PacketBody` and `MessageType` gain new variants; `ApiContext` / `EventContext` / `ServerConnectionContext` gain an `auth_context` field. All other signatures unchanged.
+- **JS SDK API**: additive — `WscallClientConfig.credential` / `withCredential()`, `K_AUTH_REQUEST` / `K_AUTH_RESPONSE` / `buildAuthRequest` exports.
+
 ## [0.5.1] - 2026-07-28
 
 > **Protocol v3** (wire-format change): the per-frame `encryption` byte has been removed from the frame header. Encryption mode is now a connection-level property determined at connection setup (PSK config or ECDH handshake). Frame header shrinks from 6 bytes to 5 bytes (`frame_len:u32 | message_type:u8`). **0.5.1 nodes cannot interoperate with ≤0.5.0 nodes at the wire level.** The Rust public API signatures are unchanged.
